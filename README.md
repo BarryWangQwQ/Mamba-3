@@ -128,13 +128,55 @@ G num_bc_heads (ngroups) | R mimo_rank | S num_rope_angles
 Q = C readout | K = B write | V = x values
 ```
 
-## Tests
+## Alignment with official
+
+This file replaces the official **kernel backend**, not the interface. Names, arguments, attributes, state layouts and calling conventions match [`mamba_ssm`](https://github.com/state-spaces/mamba) (see the API map above). Official fused kernels (Triton SISO / TileLang MIMO) are not compared here: they need `mamba-ssm` plus nvcc / Triton / TileLang, which this file is written to avoid.
+
+What is checked, on RTX 4090 / PyTorch 2.12.1+cu132, TF32 off for the numerical tests:
+
+| Check | What it compares | Result |
+|---|---|---|
+| Chunked scan vs step-by-step recurrence | Forward Y / final state, ranks R=1,2,4 | max\|Δ\| ≤ 5.7×10⁻⁶ |
+| Chunked scan vs recurrence | Gradients of (Y, h) w.r.t. V,K,Q,ADT,α,β | max\|Δ\| ≤ 1.8×10⁻⁴, relative ~2×10⁻⁷ |
+| Segmented `inference_params` resume | Concatenated segments vs one full forward | max\|Δ\| ≤ 7.2×10⁻⁷ |
+| Official `step()` path | Token-by-token decode vs one full forward | max\|Δ\| ≤ 1.3×10⁻⁶ |
+| CUDA graph vs eager | 10-frame decode, then after `initialize_states` | max\|Δ\| = 4.8×10⁻⁷ / 7.5×10⁻⁹ |
+| Official conventions | `allocate_inference_cache` shapes, B/C bias layout, `in_proj` width, RoPE split, `Block` return, `rms_norm_ref` | match `mamba_ssm` |
+
+The two documented deviations (`MixerModel` without embedding, `capture_graph` on `hidden_states`) are intentional; everything else follows the official code line by line.
+
+![Layer-level agreement with a full forward](assets/alignment.png)
+
+## Benchmarks
+
+Chunked parallel scan vs the step-by-step recurrence (the training / prefill path vs a Python recurrence). Recurrent time grows linearly with `L`; chunked time stays ~1 ms because the inner work is GEMMs.
+
+![Selective scan: recurrent vs chunked](assets/scan.png)
+
+![Chunked scan speedup vs sequence length](assets/scan_speedup.png)
+
+| Config | L=32 | L=64 | L=128 | L=256 | L=512 |
+|---|---:|---:|---:|---:|---:|
+| SISO chunked (ms) | 0.66 | 0.67 | 0.69 | 0.74 | 0.81 |
+| SISO speedup | 5.5× | 10.8× | 20.8× | 38.7× | 69.8× |
+| MIMO(R=2) chunked (ms) | 0.68 | 0.72 | 0.76 | 0.84 | 1.04 |
+| MIMO(R=2) speedup | 6.4× | 12.0× | 22.5× | 40.6× | 65.8× |
+
+Single-step decode, 3 layers, batch = 67 joints, `d_model=320` — the streaming-pose setting. CUDA graph removes kernel-launch overhead; both stay far below 16.7 ms (60 FPS).
+
+![Eager vs CUDA-graph decode latency](assets/decode.png)
+
+| `d_state` | Eager (ms) | CUDA graph (ms) | Speedup | of 60 FPS |
+|---:|---:|---:|---:|---:|
+| 16 | 3.31 | 0.50 | 6.6× | 3.0% |
+| 32 | 3.41 | 0.55 | 6.2× | 3.3% |
+| 64 | 3.48 | 0.76 | 4.6× | 4.5% |
 
 ```bash
 python test_mamba3.py
 ```
 
-The script checks that the chunked scan matches the recurrence in both values and gradients, that segmented and stepwise decode reproduce a full forward, that state / bias / norm layouts match `mamba_ssm`, and that CUDA-graph decode matches eager decode. It then prints a small benchmark if CUDA is available.
+The script re-runs the numerical checks above and prints the same class of benchmarks if CUDA is available.
 
 ## Citation
 
