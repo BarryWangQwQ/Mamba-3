@@ -412,16 +412,17 @@ def measure(device) -> dict:
 
     print("-- decode bench")
     decode_bench = []
+    dec_bs, dec_len = 64, 64
     for d_state in (16, 32, 64):
         m = MixerModel(320, n_layer=3, rms_norm=True,
                        ssm_cfg=dict(d_state=d_state, headdim=64)).to(device).eval().float()
-        x = torch.randn(67, 1, 320, device=device)
+        x = torch.randn(dec_bs, 1, 320, device=device)
         with torch.inference_mode():
-            p = InferenceParams(max_seqlen=64, max_batch_size=67)
-            p.key_value_memory_dict = m.allocate_inference_cache(67, 64)
+            p = InferenceParams(max_seqlen=dec_len, max_batch_size=dec_bs)
+            p.key_value_memory_dict = m.allocate_inference_cache(dec_bs, dec_len)
             p.seqlen_offset = 1
             t_eager = timeit(lambda: m(x, inference_params=p), iters=100, warmup=30)
-            cache = update_graph_cache(m, None, 67, 0, 64)
+            cache = update_graph_cache(m, None, dec_bs, 0, dec_len)
             t_graph = timeit(lambda: cache.run(x), iters=100, warmup=30)
         decode_bench.append({
             "d_state": d_state, "eager_ms": t_eager, "graph_ms": t_graph,
@@ -429,6 +430,7 @@ def measure(device) -> dict:
         })
         print(f"   N={d_state:2d} eager={t_eager:.3f} graph={t_graph:.3f} "
               f"{t_eager / t_graph:.1f}x")
+    decode_bench_params = {"batch": dec_bs, "n_layer": 3, "d_model": 320, "headdim": 64}
 
     print("-- trainable length: chunked scan vs the naive recurrence")
     # The recurrence is what a readable reference implementation does. Backprop through
@@ -481,6 +483,7 @@ def measure(device) -> dict:
         "decode_scaling_params": {"mamba3": n_mamba, "attention": n_attn,
                                   "d_model": d_model, "nheads": nheads, "batch": dec_batch},
         "decode_bench": decode_bench,
+        "decode_bench_params": decode_bench_params,
         "stability_len": stability_len,
         "decode_drift": decode_drift,
         "long_context": long_context,
@@ -618,7 +621,7 @@ def plot_chunk(D) -> None:
 
     _heading(fig, "Chunk size is a performance knob, not a correctness one",
              "Q partitions the same algebra, so the result holds while the GEMM shape changes",
-             "— and the measured optimum lands on the default 64 / rank")
+             "— and the fastest Q sits at or just above the default 64 / rank")
     _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  error: B=3, L=256, H=4, P=16, N=32",
             "Timing: B=8, L=512, H=6, P=64, N=64")
     _save(fig, "chunk_size.png")
@@ -739,7 +742,9 @@ def plot_decode(D) -> None:
     _heading(fig, "Single-step decode",
              f"CUDA graph is {lo:.1f}–{hi:.1f}× faster than eager, "
              f"{p_lo:.1f}–{p_hi:.1f}% of a 16.7 ms frame", axes_title=False)
-    _footer(fig, f"{D['gpu']}  ·  fp32, 3 layers, 67 joints, d_model=320",
+    m = D.get("decode_bench_params", {"batch": 64, "n_layer": 3, "d_model": 320})
+    _footer(fig, f"{D['gpu']}  ·  fp32, {m['n_layer']} layers, batch {m['batch']}, "
+                 f"d_model={m['d_model']}",
             "100 timed steps after 30 warmup")
     _save(fig, "decode.png")
 

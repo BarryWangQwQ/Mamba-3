@@ -304,8 +304,8 @@ def benchmark(device) -> None:
 
     print()
     print("=" * 72)
-    print("Per-frame decode latency: plain forward vs CUDA graph "
-          "(3 layers, 67 tokens, d_model=320)")
+    print("Single-step decode latency: plain forward vs CUDA graph "
+          "(3 layers, batch 64, d_model=320)")
     print("=" * 72)
     print(f"{'d_state':>9}{'forward':>14}{'CUDA graph':>14}{'speedup':>10}"
           f"{'of 60FPS':>12}")
@@ -315,15 +315,15 @@ def benchmark(device) -> None:
         model = MixerModel(320, n_layer=3, rms_norm=True,
                            ssm_cfg=dict(d_state=d_state, headdim=64)).to(device)
         model.eval().float()
-        x = torch.randn(67, 1, 320, device=device)
+        x = torch.randn(64, 1, 320, device=device)
 
         with torch.inference_mode():
-            params = InferenceParams(max_seqlen=64, max_batch_size=67)
-            params.key_value_memory_dict = model.allocate_inference_cache(67, 64)
+            params = InferenceParams(max_seqlen=64, max_batch_size=64)
+            params.key_value_memory_dict = model.allocate_inference_cache(64, 64)
             params.seqlen_offset = 1
             t_eager = timeit(lambda: model(x, inference_params=params), iters=100, warmup=30)
 
-            cache = update_graph_cache(model, None, 67, 0, 64)
+            cache = update_graph_cache(model, None, 64, 0, 64)
             t_graph = timeit(lambda: cache.run(x), iters=100, warmup=30)
 
         print(f"{d_state:>9}{t_eager:>12.3f}ms{t_graph:>12.3f}ms"

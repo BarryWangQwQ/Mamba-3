@@ -8,20 +8,22 @@
 <h1 align="center">Mamba-3</h1>
 
 <p align="center">
-  Single-file <a href="https://arxiv.org/abs/2603.15569">Mamba-3</a>.
-  Official <a href="https://github.com/state-spaces/mamba"><code>mamba_ssm</code></a> API.
-  PyTorch is the only dependency.
+  The whole of <a href="https://arxiv.org/abs/2603.15569">Mamba-3</a> in one file —
+  official <a href="https://github.com/state-spaces/mamba"><code>mamba_ssm</code></a> API,
+  pure PyTorch, no kernels to build.
 </p>
 
-Drop [`mamba3.py`](mamba3.py) into a project. No nvcc, CUDA Toolkit, MSVC, Triton, TileLang, einops or `mamba-ssm`. A CUDA-enabled PyTorch build is enough for GPU acceleration.
+Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you have Mamba-3 running on the GPU: SISO and MIMO, chunked prefill, single-step decode, CUDA-graph replay, gradients included.
 
-This file replaces the official **kernel backend**, not the interface. Names, arguments, attributes, state layouts and calling conventions match `mamba_ssm`, so the official docs apply as-is and weights are interchangeable.
+**Nothing to compile.** No nvcc, no CUDA Toolkit, no MSVC, no Triton, no TileLang, no einops, no `mamba-ssm`. A CUDA-enabled PyTorch build is the entire dependency list — which is what makes this work on Windows, inside a locked-down container, or on a cluster where you cannot install a toolchain.
+
+**Not a lookalike.** This file replaces the official *kernel backend*, not the interface. Module names, arguments, attributes, state layouts and calling conventions follow `mamba_ssm` exactly, and parameter names line up one-to-one with the official modules — so upstream code and docs apply to it unchanged.
 
 <div align="center">
 <table>
   <tr>
-    <td align="center" width="50%"><strong>75×</strong><br><sub>SISO scan at L=512, vs the recurrence</sub></td>
-    <td align="center" width="50%"><strong>0.42 ms</strong><br><sub>CUDA-graph decode, 67 joints</sub></td>
+    <td align="center" width="50%"><strong>72×</strong><br><sub>SISO scan at L=512, vs the recurrence</sub></td>
+    <td align="center" width="50%"><strong>0.51 ms</strong><br><sub>CUDA-graph decode, batch 64</sub></td>
   </tr>
   <tr>
     <td align="center"><strong>247×</strong><br><sub>smaller than a 16k-token KV cache</sub></td>
@@ -114,7 +116,7 @@ The error also does not accumulate. It is flat from `L=32` to `L=4096`, and a st
   <img src="assets/stability.png" width="600" alt="Error vs sequence length and vs decode step">
 </p>
 
-`chunk_size` is a tuning knob only: `Q` partitions the same algebra, so the result holds across `Q = 1 … 256` while the GEMM shape — and the speed — changes. The measured optimum lands on the documented default of `64 / mimo_rank`.
+`chunk_size` is a tuning knob only: `Q` partitions the same algebra, so the result holds across `Q = 1 … 256` while the GEMM shape — and the speed — changes. The fastest `Q` sits at or just above the documented default of `64 / mimo_rank`.
 
 <p align="center">
   <img src="assets/chunk_size.png" width="600" alt="Error and time vs chunk size">
@@ -145,10 +147,10 @@ Recurrent time grows linearly with `L`; chunked time stays near 1 ms, because th
 
 | | L=32 | L=128 | L=512 |
 |---|---:|---:|---:|
-| SISO chunked | 0.70 ms | 0.82 ms | 0.82 ms |
-| SISO vs recurrence | 5.4× | 18.6× | **74.9×** |
-| MIMO(R=2) chunked | 0.81 ms | 0.78 ms | 1.11 ms |
-| MIMO(R=2) vs recurrence | 6.1× | 24.6× | **68.1×** |
+| SISO chunked | 0.71 ms | 0.76 ms | 0.86 ms |
+| SISO vs recurrence | 5.4× | 20.2× | **71.9×** |
+| MIMO(R=2) chunked | 0.77 ms | 0.88 ms | 1.07 ms |
+| MIMO(R=2) vs recurrence | 6.3× | 21.5× | **69.2×** |
 
 </div>
 
@@ -164,10 +166,10 @@ Backprop through `L` Python steps is the wall a readable reference implementatio
 
 | Sequence length | 128 | 1k | 4k |
 |---|---:|---:|---:|
-| Recurrence, fwd + bwd | 73 ms | 636 ms | 2526 ms |
-| Chunked scan, fwd + bwd | 2.7 ms | 4.7 ms | **12.9 ms** |
-| Recurrence, peak allocated | 278 MiB | 1004 MiB | 3463 MiB |
-| Chunked scan, peak allocated | 197 MiB | 361 MiB | **921 MiB** |
+| Recurrence, fwd + bwd | 79 ms | 652 ms | 2615 ms |
+| Chunked scan, fwd + bwd | 2.9 ms | 4.9 ms | **12.9 ms** |
+| Recurrence, peak allocated | 273 MiB | 998 MiB | 3460 MiB |
+| Chunked scan, peak allocated | 192 MiB | 356 MiB | **916 MiB** |
 
 </div>
 
@@ -183,8 +185,8 @@ The reason to reach for an SSM. Decoding one token costs the same whether 256 or
 
 | Context | 256 | 1k | 4k | 16k |
 |---|---:|---:|---:|---:|
-| Attention + KV cache | 0.07 ms | 0.21 ms | 0.81 ms | 3.48 ms |
-| Mamba-3 recurrent state | 1.04 ms | 1.01 ms | 0.98 ms | **1.03 ms** |
+| Attention + KV cache | 0.08 ms | 0.21 ms | 0.78 ms | 3.09 ms |
+| Mamba-3 recurrent state | 1.03 ms | 1.06 ms | 0.99 ms | **0.98 ms** |
 | KV cache, per layer | 3.0 MiB | 12.0 MiB | 48.0 MiB | 192.0 MiB |
 | SSM state, per layer | 0.78 MiB | 0.78 MiB | 0.78 MiB | **0.78 MiB** |
 
@@ -194,7 +196,7 @@ Latency crosses over near 5k tokens; memory is flat throughout, 247× smaller at
 
 ### Eager vs CUDA-graph decode
 
-Streaming-pose setting: 3 layers, 67 joints, `d_model=320`. Single-step decode is almost pure launch overhead, which a graph replay removes.
+Decoding one token at a time, 3 layers, batch 64, `d_model=320`. At this size a step is almost pure kernel-launch overhead, which a graph replay removes.
 
 <p align="center">
   <img src="assets/decode.png" width="600" alt="Eager vs CUDA-graph decode">
@@ -204,9 +206,9 @@ Streaming-pose setting: 3 layers, 67 joints, `d_model=320`. Single-step decode i
 
 | `d_state` | Eager | CUDA graph | Speedup | of 60 FPS |
 |---:|---:|---:|---:|---:|
-| 16 | 3.57 ms | **0.42 ms** | 8.5× | 2.5% |
-| 32 | 3.57 ms | **0.48 ms** | 7.5× | 2.9% |
-| 64 | 3.40 ms | **0.64 ms** | 5.3× | 3.8% |
+| 16 | 3.52 ms | **0.51 ms** | 6.9× | 3.1% |
+| 32 | 3.54 ms | **0.55 ms** | 6.5× | 3.3% |
+| 64 | 3.66 ms | **0.75 ms** | 4.9× | 4.5% |
 
 </div>
 
