@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/architecture.png" width="580" alt="The data path of one Mamba-3 layer">
+  <img src="assets/architecture.png" width="820" alt="The data path of one Mamba-3 layer">
 </p>
 
 Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you have Mamba-3 running on the GPU: SISO and MIMO, chunked prefill, single-step decode, CUDA-graph replay, gradients included.
