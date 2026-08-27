@@ -23,18 +23,9 @@ Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you ha
 
 **Not a lookalike.** This file replaces the official *kernel backend*, not the interface. Module names, arguments, attributes, state layouts and calling conventions follow `mamba_ssm` exactly, and parameter names line up one-to-one with the official modules — so upstream code and docs apply to it unchanged.
 
-<div align="center">
-<table>
-  <tr>
-    <td align="center" width="50%"><strong>72×</strong><br><sub>SISO scan at L=512, vs the recurrence</sub></td>
-    <td align="center" width="50%"><strong>0.51 ms</strong><br><sub>CUDA-graph decode, batch 64</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>247×</strong><br><sub>smaller than a 16k-token KV cache</sub></td>
-    <td align="center"><strong>≤ 1.1×10⁻⁶</strong><br><sub>max |Δ| vs a full forward</sub></td>
-  </tr>
-</table>
-</div>
+<p align="center">
+  <img src="assets/headline.png" width="560" alt="72x faster scan, 0.51 ms decode, 247x smaller state, 1.1e-6 max error">
+</p>
 
 ---
 
