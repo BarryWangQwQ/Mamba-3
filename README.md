@@ -19,9 +19,10 @@ This file replaces the official **kernel backend**, not the interface. Names, ar
 
 <table>
   <tr>
-    <td align="center" width="33%"><strong>69.8×</strong><br><sub>SISO scan at L=512 vs recurrence</sub></td>
-    <td align="center" width="33%"><strong>0.50 ms</strong><br><sub>CUDA-graph decode, 67 joints, d_state=16</sub></td>
-    <td align="center" width="33%"><strong>≤ 10⁻⁶</strong><br><sub>max |Δ| vs a full forward, six layer configs</sub></td>
+    <td align="center" width="25%"><strong>59×</strong><br><sub>SISO scan at L=512 vs recurrence</sub></td>
+    <td align="center" width="25%"><strong>0.42 ms</strong><br><sub>CUDA-graph decode, 67 joints, d_state=16</sub></td>
+    <td align="center" width="25%"><strong>247×</strong><br><sub>smaller than a 16k-token KV cache</sub></td>
+    <td align="center" width="25%"><strong>≤ 1.1×10⁻⁶</strong><br><sub>max |Δ| vs a full forward, six layer configs</sub></td>
   </tr>
 </table>
 
@@ -84,11 +85,24 @@ What *is* checked, on an RTX 4090 / PyTorch 2.12.1+cu132, TF32 off:
 | | Compared against | max \|Δ\| |
 |---|---|---:|
 | Chunked scan, R = 1 / 2 / 4 | Step-by-step recurrence (Y, final state) | ≤ 5.7×10⁻⁶ |
-| Chunked-scan gradients | Same recurrence, d(Y,h)/d(V,K,Q,ADT,α,β) | ≤ 1.8×10⁻⁴ &nbsp;·&nbsp; rel. ~2×10⁻⁷ |
-| Segmented `inference_params` | One full forward | ≤ 7.2×10⁻⁷ |
-| Official `step()` path | One full forward | ≤ 1.3×10⁻⁶ |
-| CUDA graph, then after reset | Eager decode | 4.8×10⁻⁷ &nbsp;/&nbsp; 7.5×10⁻⁹ |
+| Chunked-scan gradients | Same recurrence, d(Y,h)/d(V,K,Q,ADT,α,β) | ≤ 1.8×10⁻⁴ &nbsp;·&nbsp; rel. ~3×10⁻⁷ |
+| Chunked scan, Q = 1 … 256 | Same recurrence, every chunk size | ≤ 1.6×10⁻⁵ |
+| Segmented `inference_params` | One full forward | ≤ 6.0×10⁻⁷ |
+| Official `step()` path | One full forward | ≤ 1.1×10⁻⁶ |
+| CUDA graph, then after reset | Eager decode | 3.6×10⁻⁷ &nbsp;/&nbsp; 1.2×10⁻⁷ |
 | State shapes, B/C bias, `in_proj`, RoPE, `Block`, `rms_norm_ref` | `mamba_ssm` conventions | match |
+
+Both state paths and the chunked scan land at or below ~10⁻⁶ against a single full-sequence forward, and the backward pass agrees with the recurrence to ~3×10⁻⁷ relative — so the file is usable for training, not only inference.
+
+<p align="center">
+  <img src="assets/alignment.png" width="960" alt="Numerical agreement with a full forward">
+</p>
+
+`chunk_size` is a tuning knob only. Q partitions the same algebra, so the result is invariant across `Q = 1 … 256` while the GEMM shape — and therefore the speed — changes. The measured optimum lands on the documented default of `64 / mimo_rank`.
+
+<p align="center">
+  <img src="assets/chunk_size.png" width="960" alt="Error and time vs chunk size">
+</p>
 
 Two deviations are intentional — the official counterparts are language-model only:
 
@@ -97,44 +111,74 @@ Two deviations are intentional — the official counterparts are language-model 
 
 Everything else follows the official code line by line. Not implemented: `cu_seqlens`, `seq_idx`, tensor parallelism, kernel-level fusion.
 
-<p align="center">
-  <img src="assets/alignment.png" width="920" alt="Numerical agreement with a full forward">
-</p>
-
 ---
 
 ## Benchmarks
 
-Chunked parallel scan vs the step-by-step recurrence. Recurrent time grows linearly with `L`; chunked time stays around 1 ms because the inner work is cuBLAS GEMMs.
+All numbers below are from one RTX 4090 / PyTorch 2.12.1+cu132, fp32.
+
+### Chunked scan vs the recurrence
+
+Recurrent time grows linearly with `L`; chunked time stays around 1 ms because the inner work is cuBLAS GEMMs.
 
 <p align="center">
-  <img src="assets/scan.png" width="920" alt="Selective scan: time and speedup">
+  <img src="assets/scan.png" width="960" alt="Selective scan: time and speedup">
 </p>
 
 | | L=32 | L=64 | L=128 | L=256 | L=512 |
 |---|---:|---:|---:|---:|---:|
-| SISO chunked | 0.66 ms | 0.67 ms | 0.69 ms | 0.74 ms | 0.81 ms |
-| SISO vs recurrence | 5.5× | 10.8× | 20.8× | 38.7× | **69.8×** |
-| MIMO(R=2) chunked | 0.68 ms | 0.72 ms | 0.76 ms | 0.84 ms | 1.04 ms |
-| MIMO(R=2) vs recurrence | 6.4× | 12.0× | 22.5× | 40.6× | **65.8×** |
+| SISO chunked | 0.69 ms | 0.68 ms | 0.69 ms | 0.70 ms | 0.95 ms |
+| SISO vs recurrence | 5.4× | 10.3× | 20.7× | 40.6× | **59.3×** |
+| MIMO(R=2) chunked | 0.68 ms | 0.71 ms | 0.82 ms | 0.84 ms | 1.20 ms |
+| MIMO(R=2) vs recurrence | 6.7× | 13.2× | 22.5× | 42.5× | **59.2×** |
 
-Single-step decode in the streaming-pose setting: 3 layers, 67 joints, `d_model=320`. CUDA graph removes kernel-launch overhead. Both stay far below a 16.7 ms / 60 FPS frame.
+### Constant state vs a growing KV cache
+
+The reason to reach for an SSM. Decoding one token costs the same whether 256 or 16384 tokens came before, and one fixed-size state replaces a cache that grows with context. A causal-attention layer of the same width, decoding against a preallocated KV cache through PyTorch SDPA, is the baseline.
 
 <p align="center">
-  <img src="assets/decode.png" width="780" alt="Eager vs CUDA-graph decode">
+  <img src="assets/decode_scaling.png" width="960" alt="Decode latency and state size vs context length">
+</p>
+
+| Context | 256 | 1k | 4k | 16k |
+|---|---:|---:|---:|---:|
+| Attention + KV cache | 0.06 ms | 0.17 ms | 0.64 ms | 2.57 ms |
+| Mamba3 recurrent state | 0.95 ms | 0.93 ms | 0.99 ms | **0.95 ms** |
+| KV cache, per layer | 3.0 MiB | 12.0 MiB | 48.0 MiB | 192.0 MiB |
+| SSM state, per layer | 0.78 MiB | 0.78 MiB | 0.78 MiB | **0.78 MiB** |
+
+Latency crosses over near 6k tokens and memory is flat throughout — 247× smaller at 16k. Two caveats worth stating: the flat line is the *eager* path, so CUDA graph moves it down further (below), and for batched **prefill** the fused attention kernels stay ahead of a pure-PyTorch scan. The structural win is in streaming decode.
+
+### Eager vs CUDA-graph decode
+
+Streaming-pose setting: 3 layers, 67 joints, `d_model=320`. Single-step decode is almost pure launch overhead, which a graph replay removes. Both stay far below a 16.7 ms / 60 FPS frame.
+
+<p align="center">
+  <img src="assets/decode.png" width="800" alt="Eager vs CUDA-graph decode">
 </p>
 
 | `d_state` | Eager | CUDA graph | Speedup | of 60 FPS |
 |---:|---:|---:|---:|---:|
-| 16 | 3.31 ms | **0.50 ms** | 6.6× | 3.0% |
-| 32 | 3.41 ms | **0.55 ms** | 6.2× | 3.3% |
-| 64 | 3.48 ms | **0.76 ms** | 4.6× | 4.5% |
+| 16 | 3.38 ms | **0.42 ms** | 8.1× | 2.5% |
+| 32 | 3.43 ms | **0.46 ms** | 7.5× | 2.7% |
+| 64 | 3.31 ms | **0.65 ms** | 5.1× | 3.9% |
+
+### Training
+
+Autograd runs straight through the chunked scan — no custom backward, no recompute hooks. Per-token cost bottoms out near `L ≈ 512–1024`, where launch overhead is amortized but chunk intermediates still fit comfortably.
+
+<p align="center">
+  <img src="assets/training.png" width="960" alt="Forward + backward time and per-token cost">
+</p>
+
+### Reproducing
 
 ```bash
-python test_mamba3.py
+python test_mamba3.py      # numerical self-checks + benchmarks
+python bench_figures.py    # re-measure and redraw every figure above
 ```
 
-Re-runs the numerical checks and prints the same class of benchmarks if CUDA is available.
+`bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU.
 
 ---
 
