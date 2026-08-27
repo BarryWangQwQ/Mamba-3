@@ -17,6 +17,7 @@ Drop [`mamba3.py`](mamba3.py) into a project. No nvcc, CUDA Toolkit, MSVC, Trito
 
 This file replaces the official **kernel backend**, not the interface. Names, arguments, attributes, state layouts and calling conventions match `mamba_ssm`, so the official docs apply as-is and weights are interchangeable.
 
+<div align="center">
 <table>
   <tr>
     <td align="center" width="50%"><strong>75×</strong><br><sub>SISO scan at L=512, vs the recurrence</sub></td>
@@ -27,6 +28,7 @@ This file replaces the official **kernel backend**, not the interface. Names, ar
     <td align="center"><strong>≤ 1.1×10⁻⁶</strong><br><sub>max |Δ| vs a full forward</sub></td>
   </tr>
 </table>
+</div>
 
 ---
 
@@ -84,6 +86,8 @@ Official fused kernels (Triton SISO / TileLang MIMO) are **not** compared: they 
 
 RTX 4090, PyTorch 2.12.1+cu132, fp32, TF32 off:
 
+<div align="center">
+
 | | Compared against | max \|Δ\| |
 |---|---|---:|
 | Chunked scan, R = 1 / 2 / 4 | Recurrence (Y, final state) | ≤ 5.7×10⁻⁶ |
@@ -95,6 +99,8 @@ RTX 4090, PyTorch 2.12.1+cu132, fp32, TF32 off:
 | 1024 consecutive `step()` calls | One full forward | ≤ 2.9×10⁻⁶ |
 | CUDA graph, then after reset | Eager decode | 3.6×10⁻⁷ / 1.2×10⁻⁷ |
 | State shapes, B/C bias, `in_proj`, RoPE, `Block`, `rms_norm_ref` | `mamba_ssm` conventions | match |
+
+</div>
 
 Both state paths reproduce a single full forward to ~10⁻⁶, and the backward pass agrees with the recurrence to ~3×10⁻⁷ relative — so the file is usable for training, not only for inference.
 
@@ -135,12 +141,16 @@ Recurrent time grows linearly with `L`; chunked time stays near 1 ms, because th
   <img src="assets/scan.png" width="600" alt="Selective scan: time and speedup">
 </p>
 
+<div align="center">
+
 | | L=32 | L=128 | L=512 |
 |---|---:|---:|---:|
 | SISO chunked | 0.70 ms | 0.82 ms | 0.82 ms |
 | SISO vs recurrence | 5.4× | 18.6× | **74.9×** |
 | MIMO(R=2) chunked | 0.81 ms | 0.78 ms | 1.11 ms |
 | MIMO(R=2) vs recurrence | 6.1× | 24.6× | **68.1×** |
+
+</div>
 
 ### Why long sequences are trainable at all
 
@@ -150,12 +160,16 @@ Backprop through `L` Python steps is the wall a readable reference implementatio
   <img src="assets/long_context.png" width="600" alt="Training step time and autograd footprint vs length">
 </p>
 
+<div align="center">
+
 | Sequence length | 128 | 1k | 4k |
 |---|---:|---:|---:|
 | Recurrence, fwd + bwd | 73 ms | 636 ms | 2526 ms |
 | Chunked scan, fwd + bwd | 2.7 ms | 4.7 ms | **12.9 ms** |
 | Recurrence, peak allocated | 278 MiB | 1004 MiB | 3463 MiB |
 | Chunked scan, peak allocated | 197 MiB | 361 MiB | **921 MiB** |
+
+</div>
 
 ### Constant state vs a growing KV cache
 
@@ -165,12 +179,16 @@ The reason to reach for an SSM. Decoding one token costs the same whether 256 or
   <img src="assets/decode_scaling.png" width="600" alt="Decode latency and state size vs context length">
 </p>
 
+<div align="center">
+
 | Context | 256 | 1k | 4k | 16k |
 |---|---:|---:|---:|---:|
 | Attention + KV cache | 0.07 ms | 0.21 ms | 0.81 ms | 3.48 ms |
 | Mamba-3 recurrent state | 1.04 ms | 1.01 ms | 0.98 ms | **1.03 ms** |
 | KV cache, per layer | 3.0 MiB | 12.0 MiB | 48.0 MiB | 192.0 MiB |
 | SSM state, per layer | 0.78 MiB | 0.78 MiB | 0.78 MiB | **0.78 MiB** |
+
+</div>
 
 Latency crosses over near 5k tokens; memory is flat throughout, 247× smaller at 16k. Two caveats worth stating plainly: that flat line is the *eager* path, so a CUDA graph moves it further down, and for batched **prefill** the fused attention kernels stay ahead of a pure-PyTorch scan. The structural win is in streaming decode.
 
@@ -182,11 +200,15 @@ Streaming-pose setting: 3 layers, 67 joints, `d_model=320`. Single-step decode i
   <img src="assets/decode.png" width="600" alt="Eager vs CUDA-graph decode">
 </p>
 
+<div align="center">
+
 | `d_state` | Eager | CUDA graph | Speedup | of 60 FPS |
 |---:|---:|---:|---:|---:|
 | 16 | 3.57 ms | **0.42 ms** | 8.5× | 2.5% |
 | 32 | 3.57 ms | **0.48 ms** | 7.5× | 2.9% |
 | 64 | 3.40 ms | **0.64 ms** | 5.3× | 3.8% |
+
+</div>
 
 ### Training throughput
 
@@ -209,6 +231,8 @@ python bench_figures.py    # re-measure and redraw every figure above
 
 ## API map
 
+<div align="center">
+
 | Official `mamba_ssm` | This file |
 |---|---|
 | `modules.mamba3.Mamba3` | `Mamba3` |
@@ -225,6 +249,8 @@ python bench_figures.py    # re-measure and redraw every figure above
 | `utils.generation.DecodingCGCache` | `DecodingCGCache` |
 | `utils.generation.capture_graph` | `capture_graph` |
 | `utils.generation.update_graph_cache` | `update_graph_cache` |
+
+</div>
 
 ## Implementation notes
 
