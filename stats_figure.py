@@ -34,6 +34,7 @@ GAP = 0.16
 RADIUS = 0.10
 NUM_SIZE, CAP_SIZE = 25.0, 9.6
 PAD = 0.30
+BLEED = 0.04    # the outer cards would otherwise be clipped to half a stroke
 
 
 def main() -> None:
@@ -42,9 +43,9 @@ def main() -> None:
     card_h = lh(NUM_SIZE) + lh(CAP_SIZE) + PAD
     ax_h = 2 * card_h + GAP
 
-    fig, ax = plt.subplots(figsize=(AX_W, ax_h))
-    ax.set_xlim(0, AX_W)
-    ax.set_ylim(0, ax_h)
+    fig, ax = plt.subplots(figsize=(AX_W + 2 * BLEED, ax_h + 2 * BLEED))
+    ax.set_xlim(-BLEED, AX_W + BLEED)
+    ax.set_ylim(-BLEED, ax_h + BLEED)
     ax.axis("off")
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
