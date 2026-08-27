@@ -1,7 +1,10 @@
-"""Draw assets/architecture.png — the data path of one Mamba3 layer, left to right.
+"""Draw assets/architecture.png — the data path of one Mamba3 layer.
 
 The order follows Mamba3.forward in mamba3.py. It is a map, not a spec: the
 formulas live in the README and in the code. Only matplotlib is needed.
+
+The flow wraps onto a second row to keep the figure close to square, so the
+labels stay legible when a phone scales the image down to its column width.
 
     python arch_figure.py
 """
@@ -38,41 +41,39 @@ plt.rcParams.update({
     "figure.facecolor": "white",
     "savefig.dpi": 200,
     "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.24,
+    "savefig.pad_inches": 0.2,
 })
 
-FIG_W, FIG_H = 9.2, 4.2
-TOP, BOTTOM = 0.872, 0.104
-
-# x runs 0..100. y is scaled so that one unit is the same physical length on
-# both axes — otherwise rounded corners come out as stretched ellipses.
-AX_W, AX_H = FIG_W, FIG_H * (TOP - BOTTOM)
-YMAX = 100.0 * AX_H / AX_W
-PT = 100.0 / (AX_W * 72.0)          # one typographic point, in canvas units
-RADIUS = 1.05                       # corner radius, same units
+# Both axes are in inches at 1:1, so rounded corners stay circular and text
+# sizes convert straight into layout space.
+AX_W = 6.0
+HEAD_H, FOOT_H = 0.56, 0.40
+RADIUS = 0.07
+MARGIN = 0.16
 
 
-def line_h(size: float) -> float:
-    return size * 1.34 * PT
+def lh(size: float) -> float:
+    """Height of one line of text, in inches."""
+    return size * 1.34 / 72.0
 
 
-def block_h(title_size: float, n_lines: int, line_size: float, pad: float) -> float:
-    return line_h(title_size) + n_lines * line_h(line_size) + pad
+def box_h(title_size: float, n_lines: int, line_size: float, pad: float) -> float:
+    return lh(title_size) + n_lines * lh(line_size) + pad
 
 
 def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=12.5, line_size=9.4):
     ax.add_patch(FancyBboxPatch(
         (x0, y0), x1 - x0, y1 - y0,
         boxstyle=f"round,pad=0,rounding_size={RADIUS}",
-        linewidth=1.5, edgecolor=color, facecolor=FILL.get(color, "white"), zorder=2,
+        linewidth=1.4, edgecolor=color, facecolor=FILL.get(color, "white"), zorder=2,
     ))
-    block = line_h(title_size) + len(lines) * line_h(line_size)
-    y = y1 - (y1 - y0 - block) / 2 - line_h(title_size) / 2
+    block = lh(title_size) + len(lines) * lh(line_size)
+    y = y1 - (y1 - y0 - block) / 2 - lh(title_size) / 2
     ax.text((x0 + x1) / 2, y, title, ha="center", va="center", fontsize=title_size,
             fontweight="semibold", color=color, zorder=3)
     prev = title_size
     for text in lines:
-        y -= line_h(prev) / 2 + line_h(line_size) / 2
+        y -= lh(prev) / 2 + lh(line_size) / 2
         prev = line_size
         ax.text((x0 + x1) / 2, y, text, ha="center", va="center", fontsize=line_size,
                 color=MUTED, zorder=3)
@@ -80,7 +81,7 @@ def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=12.5, line_size=9.4
 
 def arrow(ax, x0, y0, x1, y1, color=WIRE):
     ax.add_patch(FancyArrowPatch(
-        (x0, y0), (x1, y1),         arrowstyle="-|>", mutation_scale=11, linewidth=1.4,
+        (x0, y0), (x1, y1), arrowstyle="-|>", mutation_scale=10, linewidth=1.3,
         color=color, shrinkA=0, shrinkB=0, zorder=1, clip_on=False,
     ))
 
@@ -88,98 +89,98 @@ def arrow(ax, x0, y0, x1, y1, color=WIRE):
 def elbow(ax, pts, color=WIRE):
     """Axis-aligned polyline, arrow head on the final segment."""
     for (x0, y0), (x1, y1) in zip(pts, pts[1:-1]):
-        ax.plot([x0, x1], [y0, y1], color=color, lw=1.4, zorder=1,
+        ax.plot([x0, x1], [y0, y1], color=color, lw=1.3, zorder=1,
                 solid_capstyle="round")
     arrow(ax, *pts[-2], *pts[-1], color=color)
 
 
+# Columns, in inches from the left edge of the axes.
+X_IN = (0.50, 1.78)
+X_CHIP = (2.10, 3.50)
+X_SCAN = (3.82, 5.28)
+X_BYPASS = 5.66                                     # where z runs down
+X_GATE = (4.00, 5.10)                               # row 2, under the scan
+X_OUT = (2.31, 3.29)                                # row 2, under the branches
+
+CHIPS = [
+    (TEAL, "x  \u2192  V", "the written values"),
+    (PLUM, "B, C  \u2192  K, Q", "norm, bias, RoPE"),
+    (CORAL, "dt, A, trap", "step size, decay"),
+]
+GAP_CHIP, GAP_Z, GAP_ROW = 0.09, 0.16, 0.42
+
+
 def main() -> None:
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, YMAX)
+    z_h = box_h(12.0, 0, 9.4, 0.12)
+    chip_h = box_h(12.0, 1, 9.4, 0.13)
+    gate_h = box_h(12.5, 2, 9.4, 0.15)
+    out_h = box_h(12.5, 0, 9.4, 0.15)
+
+    row1_h = z_h + GAP_Z + 3 * chip_h + 2 * GAP_CHIP
+    ax_h = 2 * MARGIN + row1_h + GAP_ROW + gate_h
+    fig_h = ax_h + HEAD_H + FOOT_H
+
+    fig, ax = plt.subplots(figsize=(AX_W, fig_h))
+    ax.set_xlim(0, AX_W)
+    ax.set_ylim(0, ax_h)
     ax.axis("off")
-    fig.subplots_adjust(left=0, right=1, top=TOP, bottom=BOTTOM)
+    fig.subplots_adjust(left=0, right=1, top=1.0 - HEAD_H / fig_h,
+                        bottom=FOOT_H / fig_h)
 
-    chips = [
-        (TEAL, "x  →  V", "the written values"),
-        (PLUM, "B, C  →  K, Q", "norm, bias, RoPE"),
-        (CORAL, "dt, A, trap", "step size, decay"),
-    ]
-    chip_h = block_h(12.0, 1, 9.4, 2.0)
-    chip_gap = 1.35
-    z_h = block_h(12.0, 0, 9.4, 2.0)
-    z_gap = 2.5
+    z_top = ax_h - MARGIN
+    chips_top = z_top - z_h - GAP_Z
+    chips_bot = chips_top - 3 * chip_h - 2 * GAP_CHIP
+    spine = (chips_top + chips_bot) / 2                 # main flow through row 1
+    row2 = chips_bot - GAP_ROW - gate_h / 2             # centre line of row 2
 
-    # Centre the whole drawing vertically.
-    content = 3 * chip_h + 2 * chip_gap + z_gap + z_h
-    top = (YMAX + content) / 2
-    chips_bot = top - 3 * chip_h - 2 * chip_gap
-    z_top = chips_bot - z_gap
-    z_bot = z_top - z_h
-    spine = (top + chips_bot) / 2
-
-    # Columns
-    X_IN = (9.0, 21.0)
-    X_CHIP = (26.0, 44.0)
-    X_SCAN = (49.0, 66.0)
-    X_GATE = (70.5, 81.5)
-    X_OUT = (86.0, 97.0)
-
-    ax.text(2.4, spine + 1.1, "u", ha="right", va="center", fontsize=13.0,
+    ax.text(0.14, spine, "u", ha="right", va="center", fontsize=13.0,
             fontweight="semibold", color=INK)
-    ax.text(2.4, spine - 1.9, "(B, L, D)", ha="right", va="center", fontsize=9.2,
-            color=MUTED)
-    arrow(ax, 3.8, spine, X_IN[0] - 0.6, spine)
+    arrow(ax, 0.22, spine, X_IN[0] - 0.04, spine)
+    box(ax, *X_IN, chips_bot, z_top, NAVY, "in_proj", "one fused Linear", "no bias")
 
-    box(ax, *X_IN, z_bot, top, NAVY, "in_proj", "one fused Linear", "no bias")
+    # z is the first slice of the projection, and the only one that skips the scan.
+    z_cy = z_top - z_h / 2
+    box(ax, *X_CHIP, z_top - z_h, z_top, BLUE, "z", title_size=12.0)
+    arrow(ax, X_IN[1], z_cy, X_CHIP[0] - 0.04, z_cy, color=BLUE)
 
-    for i, (color, title, sub) in enumerate(chips):
-        y1 = top - i * (chip_h + chip_gap)
-        y0 = y1 - chip_h
-        cy = (y0 + y1) / 2
-        arrow(ax, X_IN[1], cy, X_CHIP[0] - 0.6, cy)
-        box(ax, *X_CHIP, y0, y1, color, title, sub, title_size=12.0)
-        arrow(ax, X_CHIP[1], cy, X_SCAN[0] - 0.6, cy)
+    for i, (color, title, sub) in enumerate(CHIPS):
+        y1 = chips_top - i * (chip_h + GAP_CHIP)
+        cy = y1 - chip_h / 2
+        arrow(ax, X_IN[1], cy, X_CHIP[0] - 0.04, cy)
+        box(ax, *X_CHIP, y1 - chip_h, y1, color, title, sub, title_size=12.0)
+        arrow(ax, X_CHIP[1], cy, X_SCAN[0] - 0.04, cy)
 
-    box(ax, *X_SCAN, chips_bot, top, NAVY, "selective scan",
+    box(ax, *X_SCAN, chips_bot, chips_top, NAVY, "selective scan",
         "chunked for prefill", "one step for decode")
-    arrow(ax, X_SCAN[1], spine, X_GATE[0] - 0.6, spine)
 
-    gate_h = block_h(12.5, 2, 9.4, 2.2)
-    box(ax, *X_GATE, spine - gate_h / 2, spine + gate_h / 2, NAVY, "gate by z",
+    # Row 1 turns down into row 2, which reads right to left.
+    scan_cx = (X_SCAN[0] + X_SCAN[1]) / 2
+    arrow(ax, scan_cx, chips_bot, scan_cx, row2 + gate_h / 2 + 0.04)
+    box(ax, *X_GATE, row2 - gate_h / 2, row2 + gate_h / 2, NAVY, "gate by z",
         "optional", "RMSNorm first")
-    arrow(ax, X_GATE[1], spine, X_OUT[0] - 0.6, spine)
+    elbow(ax, [(X_CHIP[1], z_cy), (X_BYPASS, z_cy), (X_BYPASS, row2),
+               (X_GATE[1] + 0.04, row2)], color=BLUE)
 
-    out_h = block_h(12.5, 0, 9.4, 2.2)
-    box(ax, *X_OUT, spine - out_h / 2, spine + out_h / 2, NAVY, "out_proj")
-    arrow(ax, X_OUT[1], spine, X_OUT[1] + 3.8, spine)
-    ax.text(X_OUT[1] + 5.2, spine + 1.1, "out", ha="left", va="center", fontsize=13.0,
+    arrow(ax, X_GATE[0], row2, X_OUT[1] + 0.04, row2)
+    box(ax, *X_OUT, row2 - out_h / 2, row2 + out_h / 2, NAVY, "out_proj")
+    arrow(ax, X_OUT[0], row2, X_OUT[0] - 0.32, row2)
+    ax.text(X_OUT[0] - 0.40, row2, "out", ha="right", va="center", fontsize=13.0,
             fontweight="semibold", color=INK)
-    ax.text(X_OUT[1] + 5.2, spine - 1.9, "(B, L, D)", ha="left", va="center",
-            fontsize=9.2, color=MUTED)
 
-    # z leaves in_proj, bypasses the scan, and meets the flow again at the gate.
-    z_cy = (z_top + z_bot) / 2
-    gate_cx = (X_GATE[0] + X_GATE[1]) / 2
-    box(ax, *X_CHIP, z_bot, z_top, BLUE, "z", title_size=12.0)
-    arrow(ax, X_IN[1], z_cy, X_CHIP[0] - 0.6, z_cy, color=BLUE)
-    elbow(ax, [(X_CHIP[1], z_cy), (gate_cx, z_cy), (gate_cx, spine - gate_h / 2 - 0.6)],
-          color=BLUE)
-
-    fig.text(0.0, 0.99, "One Mamba-3 layer", fontsize=15.5, fontweight="semibold",
-             color=INK, va="top")
-    fig.text(0.0, 0.945, "Exponential-trapezoidal discretization and a rotary state "
-                         "space, in the order mamba3.py runs them.", fontsize=10.6,
-             color=MUTED, va="top")
-    fig.text(0.0, 0.072, "Decode carries one fixed-size state per layer: "
-                         "ssm (B, H, P, N), plus k, v and the accumulated RoPE angle.",
-             fontsize=9.5, color=MUTED, va="top")
-    fig.text(0.0, 0.018, "B batch  ·  H heads  ·  P headdim  ·  N d_state",
-             fontsize=9.5, color=MUTED, va="top")
+    fig.text(0.0, 1.0 - 0.05 / fig_h, "One Mamba-3 layer", fontsize=15.0,
+             fontweight="semibold", color=INK, va="top")
+    fig.text(0.0, 1.0 - 0.32 / fig_h, "The data path, in the order mamba3.py runs it.",
+             fontsize=10.2, color=MUTED, va="top")
+    fig.text(0.0, (FOOT_H - 0.06) / fig_h, "Decode keeps one fixed-size state per "
+             "layer: ssm (B, H, P, N), k, v, RoPE angle.", fontsize=9.3, color=MUTED,
+             va="top")
+    fig.text(0.0, (FOOT_H - 0.24) / fig_h, "u, out are (B, L, D)  \u00b7  B batch  "
+             "\u00b7  H heads  \u00b7  P headdim  \u00b7  N d_state",
+             fontsize=9.3, color=MUTED, va="top")
 
     fig.savefig(ASSETS / "architecture.png")
     plt.close(fig)
-    print("wrote architecture.png")
+    print(f"wrote architecture.png  ({AX_W:.2f} x {fig_h:.2f} in)")
 
 
 if __name__ == "__main__":
