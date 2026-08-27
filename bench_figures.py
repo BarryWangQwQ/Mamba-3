@@ -48,17 +48,23 @@ BLUE = "#1D4ED8"
 SLATE = "#64748B"
 PLUM = "#7C3AED"
 
+# Figures are read on GitHub, often on a phone where the image is scaled to the
+# device width. A narrow canvas with large type survives that; a wide one does not.
+WIDTH = 6.8
+
 plt.rcParams.update({
     "font.family": ["Segoe UI", "DejaVu Sans"],
-    "font.size": 10.5,
-    "axes.titlesize": 11.5,
-    "axes.labelsize": 10.5,
+    "font.size": 12.0,
+    "axes.titlesize": 13.0,
+    "axes.labelsize": 12.0,
     "axes.labelcolor": INK,
     "axes.edgecolor": HAIR,
-    "axes.linewidth": 0.8,
+    "axes.linewidth": 0.9,
     "axes.spines.top": False,
     "axes.spines.right": False,
     "text.color": INK,
+    "xtick.labelsize": 11.5,
+    "ytick.labelsize": 11.5,
     "xtick.color": MUTED,
     "ytick.color": MUTED,
     "xtick.major.size": 0,
@@ -66,32 +72,60 @@ plt.rcParams.update({
     "figure.facecolor": "white",
     "axes.facecolor": "white",
     "legend.frameon": False,
+    "legend.fontsize": 10.8,
+    "lines.linewidth": 2.2,
     "savefig.dpi": 200,
     "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.24,
+    "savefig.pad_inches": 0.22,
 })
 
 
 def _style(ax, *, log=False):
     ax.set_axisbelow(True)
-    ax.yaxis.grid(True, color=GRID, linewidth=0.9, which="major")
+    ax.yaxis.grid(True, color=GRID, linewidth=1.0, which="major")
     if log:
-        ax.yaxis.grid(True, color=GRID, linewidth=0.5, which="minor")
+        ax.yaxis.grid(True, color=GRID, linewidth=0.6, which="minor")
     ax.xaxis.grid(False)
     ax.tick_params(axis="both", pad=4)
 
 
-def _heading(fig, title: str, subtitle: str) -> None:
-    """Title and subtitle above everything, in figure coordinates.
+def _single(height=4.2):
+    return plt.subplots(figsize=(WIDTH, height))
 
-    Kept off the axes so they can never collide with per-axes titles.
+
+def _stacked(height=7.0, ratios=(1, 1), share_x=False):
+    """Two panels one above the other.
+
+    Stacking keeps the image close to square, so a phone that scales it to the
+    device width does not shrink the type as much as a side-by-side layout would.
     """
-    fig.text(0.0, 1.055, title, fontsize=14, fontweight="semibold", color=INK, va="bottom")
-    fig.text(0.0, 1.005, subtitle, fontsize=9.0, color=MUTED, va="bottom")
+    fig, axes = plt.subplots(2, 1, figsize=(WIDTH, height), sharex=share_x,
+                             gridspec_kw={"height_ratios": list(ratios)})
+    fig.subplots_adjust(hspace=0.30 if share_x else 0.44)
+    return fig, axes
 
 
-def _footer(fig, text: str) -> None:
-    fig.text(0.0, -0.035, text, fontsize=8.3, color=MUTED, va="top")
+def _heading(fig, title: str, *subtitle: str, axes_title: bool = True) -> None:
+    """Title and subtitle in the margin reserved above the axes.
+
+    The reserved band includes room for the first panel's own title, which is
+    drawn above its axes and would otherwise land on the subtitle.
+    """
+    h = fig.get_figheight()
+    fig.subplots_adjust(top=1.0 - (0.30 + 0.32 * axes_title + 0.21 * len(subtitle)) / h)
+    y = 1.0 - 0.04 / h
+    fig.text(0.0, y, title, fontsize=15.0, fontweight="semibold", color=INK, va="top")
+    for i, line in enumerate(subtitle):
+        y -= (0.30 if i == 0 else 0.21) / h
+        fig.text(0.0, y, line, fontsize=11.0, color=MUTED, va="top")
+
+
+def _footer(fig, *lines: str) -> None:
+    h = fig.get_figheight()
+    y = -0.06 / h
+    for line in lines:
+        fig.text(0.0, y, line, fontsize=9.6, color=MUTED, va="top")
+        y -= 0.17 / h
 
 
 def _save(fig, name: str) -> None:
@@ -261,6 +295,38 @@ def measure(device) -> dict:
         cg_reset = (cache.run(frames[0]) - ref[0]).abs().max().item()
     print(f"   graph={cg_err:.2e}  reset={cg_reset:.2e}")
 
+    print("-- error vs sequence length")
+    stability_len = []
+    for L in (32, 64, 128, 256, 512, 1024, 2048, 4096):
+        args, state = scan_inputs(device, seqlen=L, rank=1)
+        y_ref, h_ref = _recurrent_scan(*args, *state)
+        y, h = _chunk_scan(*args, *state, chunk_size=64)
+        stability_len.append({
+            "seqlen": L,
+            "err_y": (y - y_ref).abs().max().item(),
+            "err_h": (h - h_ref).abs().max().item(),
+            "scale_y": y_ref.abs().max().item(),
+            "scale_h": h_ref.abs().max().item(),
+        })
+        r = stability_len[-1]
+        print(f"   L={L:5d}  Y={r['err_y']:.2e}  H={r['err_h']:.2e}")
+
+    print("-- streaming decode drift")
+    drift_steps = 1024
+    drift_mixer = Mamba3(d_model=128, d_state=32, headdim=32, layer_idx=0).to(device).float()
+    u = torch.randn(2, drift_steps, 128, device=device)
+    with torch.no_grad():
+        y_full = drift_mixer(u)
+        p = InferenceParams(max_seqlen=drift_steps, max_batch_size=2)
+        states = drift_mixer._get_states_from_cache(p, 2)
+        drift = [(drift_mixer.step(u[:, t], *states)[0] - y_full[:, t]).abs().max().item()
+                 for t in range(drift_steps)]
+    decode_drift = {"steps": drift_steps, "err": drift, "scale": y_full.abs().max().item()}
+    print(f"   {drift_steps} steps: first={drift[0]:.2e}  last={drift[-1]:.2e}  "
+          f"max={max(drift):.2e}")
+    del u, y_full
+    torch.cuda.empty_cache()
+
     torch.backends.cuda.matmul.allow_tf32 = tf32
 
     print("-- scan bench")
@@ -364,6 +430,41 @@ def measure(device) -> dict:
         print(f"   N={d_state:2d} eager={t_eager:.3f} graph={t_graph:.3f} "
               f"{t_eager / t_graph:.1f}x")
 
+    print("-- trainable length: chunked scan vs the naive recurrence")
+    # The recurrence is what a readable reference implementation does. Backprop through
+    # L Python steps is what makes long-sequence training impractical, in time and in
+    # the size of the autograd graph.
+    long_context = []
+    for L in (128, 256, 512, 1024, 2048, 4096):
+        args, state = scan_inputs(device, seqlen=L, rank=1, batch=4, nheads=6, headdim=64,
+                                  d_state=64, requires_grad=True)
+
+        def step(fn, **kw):
+            def run():
+                for t in args:
+                    t.grad = None
+                y, h = fn(*args, *state, **kw)
+                (y.square().mean() + h.square().mean()).backward()
+            return run
+
+        row = {"seqlen": L}
+        for tag, fn, kw in (("chunked", _chunk_scan, dict(chunk_size=64)),
+                            ("recurrent", _recurrent_scan, {})):
+            try:
+                row[f"{tag}_ms"] = timeit(step(fn, **kw), iters=5, warmup=2)
+                row[f"{tag}_mb"] = peak_mem_mb(step(fn, **kw))
+            except torch.OutOfMemoryError:
+                row[f"{tag}_ms"] = row[f"{tag}_mb"] = None
+                torch.cuda.empty_cache()
+                print(f"   L={L:5d}  {tag}: out of memory")
+        long_context.append(row)
+        print(f"   L={L:5d}  chunked={row['chunked_ms']:7.2f}ms/{row['chunked_mb']:8.1f}MB   "
+              f"recurrent={row['recurrent_ms']:8.2f}ms/{row['recurrent_mb']:9.1f}MB")
+        del args, state
+        torch.cuda.empty_cache()
+    long_context_params = {"batch": 4, "nheads": 6, "headdim": 64, "d_state": 64,
+                           "chunk_size": 64}
+
     payload = {
         "gpu": torch.cuda.get_device_name(0),
         "torch": torch.__version__,
@@ -380,6 +481,10 @@ def measure(device) -> dict:
         "decode_scaling_params": {"mamba3": n_mamba, "attention": n_attn,
                                   "d_model": d_model, "nheads": nheads, "batch": dec_batch},
         "decode_bench": decode_bench,
+        "stability_len": stability_len,
+        "decode_drift": decode_drift,
+        "long_context": long_context,
+        "long_context_params": long_context_params,
     }
     (ASSETS / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
@@ -391,45 +496,45 @@ def measure(device) -> dict:
 def plot_scan(D) -> None:
     rows = D["scan_bench"]
     seqlens = [32, 64, 128, 256, 512]
-    fig, (ax_t, ax_s) = plt.subplots(1, 2, figsize=(11.6, 4.5))
-    fig.subplots_adjust(wspace=0.26)
+    fig, (ax_t, ax_s) = _stacked(height=7.1, share_x=True)
 
     for tag, color in (("SISO", TEAL), ("MIMO(R=2)", CORAL)):
         sel = [r for r in rows if r["tag"] == tag]
         xs = [r["seqlen"] for r in sel]
-        ax_t.plot(xs, [r["recurrent_ms"] for r in sel], color=color, ls=(0, (3.2, 2.2)), lw=1.7,
-                  marker="o", ms=5.5, mfc="white", mew=1.6, label=f"{tag}  recurrent")
-        ax_t.plot(xs, [r["chunked_ms"] for r in sel], color=color, lw=2.0,
-                  marker="s", ms=5.0, label=f"{tag}  chunked")
-        spd = [r["speedup"] for r in sel]
-        ax_s.plot(xs, spd, color=color, lw=2.0, marker="o", ms=6.0, mfc="white", mew=1.7, label=tag)
+        ax_t.plot(xs, [r["recurrent_ms"] for r in sel], color=color, ls=(0, (3.2, 2.2)), lw=1.9,
+                  marker="o", ms=6.5, mfc="white", mew=1.8, label=f"{tag}  recurrent")
+        ax_t.plot(xs, [r["chunked_ms"] for r in sel], color=color,
+                  marker="s", ms=5.8, label=f"{tag}  chunked")
+        ax_s.plot(xs, [r["speedup"] for r in sel], color=color,
+                  marker="o", ms=7.0, mfc="white", mew=1.9, label=tag)
 
     for ax in (ax_t, ax_s):
         _style(ax)
         ax.set_xticks(seqlens)
-        ax.set_xlim(20, 564)
-        ax.set_xlabel("Sequence length")
+        ax.set_xticklabels(["32", "", "128", "256", "512"])
+        ax.set_xlim(16, 568)
+    ax_s.set_xlabel("Sequence length")
     ax_t.set_title("Scan time", loc="left")
-    ax_s.set_title("Speedup", loc="left")
+    ax_s.set_title("Speedup over the recurrence", loc="left")
     ax_t.set_ylabel("Milliseconds")
-    ax_s.set_ylabel("× faster than recurrence")
-    ax_t.set_ylim(0, 76)
-    ax_s.set_ylim(0, 84)
-    ax_t.legend(loc="upper left", fontsize=8.6)
-    ax_s.legend(loc="upper left", fontsize=8.6)
-    ax_t.yaxis.set_major_locator(mticker.MultipleLocator(15))
+    ax_s.set_ylabel("× faster")
+    ax_t.set_ylim(0, 80)
+    ax_s.set_ylim(0, 78)
+    ax_t.legend(loc="upper left", ncol=2, columnspacing=1.0, handlelength=1.8)
+    ax_s.legend(loc="upper left")
+    ax_t.yaxis.set_major_locator(mticker.MultipleLocator(20))
     ax_s.yaxis.set_major_locator(mticker.MultipleLocator(20))
 
     tail = [r["speedup"] for r in rows if r["seqlen"] == seqlens[-1]]
     lo, hi = round(min(tail)), round(max(tail))
-    label = f"{lo}× at L={seqlens[-1]}" if lo == hi else f"{lo}–{hi}× at L={seqlens[-1]}"
-    ax_s.annotate(label,
-                  (seqlens[-1], max(tail)), textcoords="offset points", xytext=(-10, 12),
-                  ha="right", color=INK, fontsize=9.5, fontweight="semibold")
+    ax_s.annotate(f"{lo}×" if lo == hi else f"{lo}–{hi}×",
+                  (seqlens[-1], max(tail)), textcoords="offset points", xytext=(-8, 10),
+                  ha="right", color=INK, fontsize=12, fontweight="semibold")
 
-    _heading(fig, "Selective scan — chunked GEMM vs step-by-step recurrence",
+    _heading(fig, "Chunked GEMM vs step-by-step recurrence",
              "Recurrent cost grows linearly with L; the chunked path stays near 1 ms")
-    _footer(fig, f"{D['gpu']}  ·  B=3, H=4, P=16, N=32  ·  SISO chunk=64, MIMO(R=2) chunk=32")
+    _footer(fig, f"{D['gpu']}  ·  fp32, B=3, H=4, P=16, N=32",
+            "SISO chunk=64, MIMO(R=2) chunk=32")
     _save(fig, "scan.png")
 
 
@@ -437,152 +542,148 @@ def plot_decode_scaling(D) -> None:
     rows = D["decode_scaling"]
     meta = D["decode_scaling_params"]
     xs = [r["context"] for r in rows]
-    fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(11.6, 4.5))
-    fig.subplots_adjust(wspace=0.26)
+    fig, (ax_t, ax_m) = _stacked(height=7.1, share_x=True)
 
-    ax_t.plot(xs, [r["attn_ms"] for r in rows], color=PLUM, lw=2.0, marker="o", ms=5.5,
-              mfc="white", mew=1.7, label="Attention + KV cache")
-    ax_t.plot(xs, [r["mamba_ms"] for r in rows], color=TEAL, lw=2.0, marker="s", ms=5.0,
-              label="Mamba3 recurrent state")
-    ax_m.plot(xs, [r["attn_cache_mb"] for r in rows], color=PLUM, lw=2.0, marker="o", ms=5.5,
-              mfc="white", mew=1.7, label="KV cache")
-    ax_m.plot(xs, [r["mamba_state_mb"] for r in rows], color=TEAL, lw=2.0, marker="s", ms=5.0,
+    ax_t.plot(xs, [r["attn_ms"] for r in rows], color=PLUM, marker="o", ms=6.5,
+              mfc="white", mew=1.9, label="Attention + KV cache")
+    ax_t.plot(xs, [r["mamba_ms"] for r in rows], color=TEAL, marker="s", ms=5.8,
+              label="Mamba-3 recurrent state")
+    ax_m.plot(xs, [r["attn_cache_mb"] for r in rows], color=PLUM, marker="o", ms=6.5,
+              mfc="white", mew=1.9, label="KV cache")
+    ax_m.plot(xs, [r["mamba_state_mb"] for r in rows], color=TEAL, marker="s", ms=5.8,
               label="SSM state")
 
     last = rows[-1]
-    ax_m.annotate(f"{last['attn_cache_mb'] / last['mamba_state_mb']:.0f}× smaller\nat 16k context",
-                  (xs[-1], last["mamba_state_mb"]), textcoords="offset points", xytext=(-6, 16),
-                  ha="right", color=TEAL, fontsize=9.5, fontweight="semibold")
+    ax_m.annotate(f"{last['attn_cache_mb'] / last['mamba_state_mb']:.0f}× smaller at 16k",
+                  (xs[-1], last["mamba_state_mb"]), textcoords="offset points", xytext=(-8, 14),
+                  ha="right", color=TEAL, fontsize=11.5, fontweight="semibold")
 
     for ax in (ax_t, ax_m):
         _style(ax, log=True)
         ax.set_xscale("log", base=2)
         ax.set_xticks(xs)
         ax.set_xticklabels([f"{v // 1024}k" if v >= 1024 else str(v) for v in xs])
-        ax.set_xlabel("Context already consumed  (tokens)")
-        ax.legend(loc="upper left", fontsize=8.6)
-    ax_t.set_ylabel("Per-token decode latency  (ms)")
-    ax_m.set_ylabel("Cache / state per layer  (MiB, log)")
+        ax.legend(loc="upper left")
+    ax_m.set_xlabel("Context already consumed  (tokens)")
+    ax_t.set_ylabel("Decode latency  (ms)")
+    ax_m.set_ylabel("Per layer  (MiB, log)")
     ax_m.set_yscale("log")
-    ax_t.set_ylim(bottom=0)
-    ax_t.set_title("Decode latency", loc="left")
-    ax_m.set_title("What has to be kept", loc="left")
+    ax_t.set_ylim(0, max(r["attn_ms"] for r in rows) * 1.12)
+    ax_t.set_title("One more token, whatever the context", loc="left")
+    ax_m.set_title("What has to be kept around", loc="left")
 
-    _heading(fig, "Constant state vs a growing KV cache — one layer, one token",
-             "Decoding cost and memory do not depend on how much context was already consumed")
-    _footer(fig, f"{D['gpu']}  ·  fp32, B={meta['batch']}, d_model={meta['d_model']}, "
-                 f"{meta['nheads']} heads  ·  attention baseline is PyTorch SDPA on a "
-                 f"preallocated cache  ·  for batched prefill, fused attention kernels stay "
-                 f"competitive; the SSM advantage is here")
+    _heading(fig, "Constant state vs a growing KV cache",
+             "Decode cost and memory do not depend on how much context came before")
+    _footer(fig, f"{D['gpu']}  ·  fp32, one layer, B={meta['batch']}, "
+                 f"d_model={meta['d_model']}, {meta['nheads']} heads",
+            "Baseline: PyTorch SDPA over a preallocated cache. Eager path — CUDA graph is faster.")
     _save(fig, "decode_scaling.png")
 
 
 def plot_chunk(D) -> None:
     sweep, speed = D["chunk_sweep"], D["chunk_speed"]
-    fig, (ax_e, ax_t) = plt.subplots(1, 2, figsize=(11.6, 4.5))
-    fig.subplots_adjust(wspace=0.26)
+    fig, (ax_e, ax_t) = _stacked(height=7.3)
 
     for rank, color in ((1, TEAL), (2, CORAL), (4, NAVY)):
         sel = [r for r in sweep if r["rank"] == rank]
-        ax_e.plot([r["chunk_size"] for r in sel], [r["err"] for r in sel], color=color, lw=1.9,
-                  marker="o", ms=5.0, mfc="white", mew=1.5, label=f"R={rank}")
-    ax_e.axhline(1e-4, color=HAIR, lw=0.9, ls=(0, (3, 2)))
-    ax_e.text(1.05, 1.15e-4, "test tolerance  1×10⁻⁴", color=MUTED, fontsize=8.4, va="bottom")
+        ax_e.plot([r["chunk_size"] for r in sel], [r["err"] for r in sel], color=color, lw=2.0,
+                  marker="o", ms=6.0, mfc="white", mew=1.7, label=f"R={rank}")
+    ax_e.axhline(1e-4, color=SLATE, lw=1.0, ls=(0, (3, 2)))
+    ax_e.text(1.05, 1.2e-4, "test tolerance  1×10⁻⁴", color=MUTED, fontsize=10.5, va="bottom")
 
     for i, (rank, color) in enumerate(((1, TEAL), (2, CORAL))):
         sel = [r for r in speed if r["rank"] == rank]
-        ax_t.plot([r["chunk_size"] for r in sel], [r["ms"] for r in sel], color=color, lw=2.0,
-                  marker="s", ms=5.0, label=f"R={rank}")
+        ax_t.plot([r["chunk_size"] for r in sel], [r["ms"] for r in sel], color=color,
+                  marker="s", ms=6.0, label=f"R={rank}")
         best = min(sel, key=lambda r: r["ms"])
-        ax_t.text(0.40, 0.93 - 0.085 * i, f"R={rank}  fastest at Q={best['chunk_size']}",
-                  transform=ax_t.transAxes, color=color, fontsize=9.2, fontweight="semibold")
+        ax_t.text(0.35, 0.92 - 0.11 * i, f"R={rank} fastest at Q={best['chunk_size']}",
+                  transform=ax_t.transAxes, color=color, fontsize=11.5, fontweight="semibold")
 
     for ax in (ax_e, ax_t):
         _style(ax, log=True)
         ax.set_xscale("log", base=2)
         ax.set_xlabel("Chunk size Q")
-    ax_e.legend(loc="lower right", fontsize=8.6)
-    ax_t.legend(loc="lower left", fontsize=8.6)
+    ax_e.legend(loc="center left", ncol=3, columnspacing=1.2, handlelength=1.8)
+    ax_t.legend(loc="lower left")
     ax_e.set_yscale("log")
-    ax_e.set_xticks([1, 2, 4, 8, 16, 32, 64, 128, 256])
-    ax_e.set_xticklabels(["1", "2", "4", "8", "16", "32", "64", "128", "256"])
-    ax_e.set_ylim(1e-6, 4e-4)
+    ax_e.set_xticks([1, 4, 16, 64, 256])
+    ax_e.set_xticklabels(["1", "4", "16", "64", "256"])
+    ax_e.set_ylim(2e-6, 3e-4)
     ax_e.set_ylabel("max |Δ|  vs recurrence")
-    ax_e.set_title("Every chunk size agrees with the recurrence", loc="left")
+    ax_e.set_title("Every chunk size agrees", loc="left")
     ax_t.set_xticks([8, 16, 32, 64, 128, 256])
     ax_t.set_xticklabels(["8", "16", "32", "64", "128", "256"])
     ax_t.set_ylabel("Milliseconds")
-    ax_t.set_title("Chunk size only changes speed", loc="left")
+    ax_t.set_title("Only the speed moves", loc="left")
 
     _heading(fig, "Chunk size is a performance knob, not a correctness one",
-             "Q only partitions the same algebra, so the result holds while the GEMM shape "
-             "changes — and the measured optimum lands on the default 64 / rank")
-    _footer(fig, f"{D['gpu']}  ·  error: B=3, L=256, H=4, P=16, N=32, fp32, TF32 off  ·  "
-                 f"timing: B=8, L=512, H=6, P=64, N=64")
+             "Q partitions the same algebra, so the result holds while the GEMM shape changes",
+             "— and the measured optimum lands on the default 64 / rank")
+    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  error: B=3, L=256, H=4, P=16, N=32",
+            "Timing: B=8, L=512, H=6, P=64, N=64")
     _save(fig, "chunk_size.png")
 
 
 def plot_training(D) -> None:
     rows = D["train_bench"]
-    fig, (ax_t, ax_p) = plt.subplots(1, 2, figsize=(11.6, 4.5))
-    fig.subplots_adjust(wspace=0.26)
+    fig, (ax_t, ax_p) = _stacked(height=7.1, share_x=True)
 
     for tag, color in (("SISO", TEAL), ("MIMO(R=2)", CORAL)):
         sel = [r for r in rows if r["tag"] == tag]
         xs = [r["seqlen"] for r in sel]
-        ax_t.plot(xs, [r["ms"] for r in sel], color=color, lw=2.0, marker="o", ms=5.5,
-                  mfc="white", mew=1.7, label=tag)
-        ax_p.plot(xs, [r["us_per_token"] for r in sel], color=color, lw=2.0, marker="s", ms=5.0,
+        ax_t.plot(xs, [r["ms"] for r in sel], color=color, marker="o", ms=6.5,
+                  mfc="white", mew=1.9, label=tag)
+        ax_p.plot(xs, [r["us_per_token"] for r in sel], color=color, marker="s", ms=5.8,
                   label=tag)
 
     for ax in (ax_t, ax_p):
         _style(ax)
         ax.set_xscale("log", base=2)
         ax.set_xticks([128, 256, 512, 1024, 2048])
-        ax.set_xticklabels(["128", "256", "512", "1024", "2048"])
-        ax.set_xlabel("Sequence length")
-        ax.legend(loc="upper left" if ax is ax_t else "upper right", fontsize=8.6)
-    ax_t.set_ylabel("Forward + backward  (ms)")
-    ax_p.set_ylabel("Microseconds per token")
+        ax.set_xticklabels(["128", "256", "512", "1k", "2k"])
+    ax_t.legend(loc="upper left")
+    ax_p.legend(loc="upper center", ncol=2, columnspacing=1.4)
+    ax_p.set_xlabel("Sequence length")
+    ax_t.set_ylabel("Fwd + bwd  (ms)")
+    ax_p.set_ylabel("Microseconds / token")
     ax_t.set_ylim(bottom=0)
     ax_p.set_ylim(bottom=0)
     ax_t.set_title("Training step", loc="left")
     ax_p.set_title("Cost per token", loc="left")
 
-    _heading(fig, "Training — autograd straight through the chunked scan",
-             "Per-token cost bottoms out near L≈512–1024, where launch overhead is amortized "
-             "but chunk intermediates still fit comfortably")
-    _footer(fig, f"{D['gpu']}  ·  fp32, B=8, d_model=384, N=64, P=64  ·  "
-                 f"one zero_grad + forward + backward per step")
+    _heading(fig, "Autograd straight through the chunked scan",
+             "Per-token cost bottoms out near L≈512–1024: launch overhead is amortized,",
+             "chunk intermediates still fit comfortably")
+    _footer(fig, f"{D['gpu']}  ·  fp32, B=8, d_model=384, N=64, P=64",
+            "One zero_grad + forward + backward per step, no custom kernel")
     _save(fig, "training.png")
 
 
 def plot_alignment(D) -> None:
     rows = D["layer_alignment"]
     scan = D["scan_alignment"]
-    labels = ["SISO", "SISO\n+ outproj norm", "SISO\n+ rope = 1",
-              "MIMO  R=2", "MIMO  R=4\n+ norm", "MIMO  R=4\n+ unfused"]
+    labels = ["SISO", "SISO\n+ norm", "SISO\nrope = 1",
+              "MIMO\nR=2", "MIMO R=4\n+ norm", "MIMO R=4\nunfused"]
 
-    fig, (ax_l, ax_s) = plt.subplots(1, 2, figsize=(12.2, 4.5),
-                                     gridspec_kw={"width_ratios": [1.55, 1.0]})
-    fig.subplots_adjust(wspace=0.24)
+    fig, (ax_l, ax_s) = _stacked(height=7.6, ratios=(1.15, 1.0))
 
     x = np.arange(len(rows))
-    w = 0.36
+    w = 0.38
     ax_l.bar(x - w / 2, [r["segmented"] for r in rows], w, color=NAVY,
              label="Segmented resume", zorder=2)
     ax_l.bar(x + w / 2, [r["stepwise"] for r in rows], w, color=TEAL,
              label="Official step()", zorder=2)
     _style(ax_l, log=True)
     ax_l.set_yscale("log")
-    ax_l.set_ylim(8e-8, 2.4e-6)
-    ax_l.axhline(1e-6, color=HAIR, lw=0.9, ls=(0, (3, 2)))
-    ax_l.text(len(rows) - 0.45, 1.1e-6, "1×10⁻⁶", color=MUTED, fontsize=8.4, ha="right", va="bottom")
+    ax_l.set_ylim(8e-8, 3.2e-6)
+    ax_l.axhline(1e-6, color=SLATE, lw=1.0, ls=(0, (3, 2)))
+    ax_l.text(len(rows) - 0.42, 1.15e-6, "1×10⁻⁶", color=MUTED, fontsize=10.5,
+              ha="right", va="bottom")
     ax_l.set_xticks(x)
-    ax_l.set_xticklabels(labels, fontsize=8.5)
-    ax_l.set_ylabel("max |Δ|  vs full-sequence forward")
-    ax_l.set_title("Layer configs — state paths vs one full forward", loc="left")
-    ax_l.legend(loc="upper left", fontsize=8.6, ncol=2)
+    ax_l.set_xticklabels(labels, fontsize=10.0)
+    ax_l.set_ylabel("max |Δ|  vs full forward")
+    ax_l.set_title("Layer configs — resumed state vs one full forward", loc="left")
+    ax_l.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
     xr = np.arange(len(scan))
     ax_s.bar(xr - w / 2, [r["fwd_y"] for r in scan], w, color=CORAL, label="Forward", zorder=2)
@@ -590,27 +691,27 @@ def plot_alignment(D) -> None:
              label="Gradient (relative)", zorder=2)
     _style(ax_s, log=True)
     ax_s.set_yscale("log")
-    ax_s.set_ylim(1e-8, 3e-5)
+    ax_s.set_ylim(1e-8, 8e-5)
     ax_s.set_xticks(xr)
     ax_s.set_xticklabels([f"R={r['rank']}" for r in scan])
     ax_s.set_ylabel("max |Δ|  vs recurrence")
-    ax_s.set_title("Scan — chunked vs recurrence", loc="left")
-    ax_s.legend(loc="upper left", fontsize=8.6)
+    ax_s.set_title("Chunked scan — forward and backward", loc="left")
+    ax_s.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
     cg = D["cuda_graph_max_abs_diff"]
     _heading(fig, "Numerical agreement",
-             f"Every alternative path reproduces the reference to ~10⁻⁶ or better  ·  "
+             f"Every alternative path reproduces the reference to ~10⁻⁶ or better.",
              f"CUDA-graph decode vs eager: {cg:.1e}")
-    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 disabled  ·  "
-                 f"left: B=3, L=40, d_model=128, N=32  ·  right: B=3, L=40, chunk=8")
+    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 disabled  ·  B=3, L=40",
+            "Top: d_model=128, N=32.  Bottom: H=4, P=16, N=32, chunk=8")
     _save(fig, "alignment.png")
 
 
 def plot_decode(D) -> None:
     rows = D["decode_bench"]
-    fig, ax = plt.subplots(figsize=(8.4, 4.5))
+    fig, ax = _single(height=4.4)
     x = np.arange(len(rows))
-    w = 0.36
+    w = 0.38
     eager = [r["eager_ms"] for r in rows]
     graph = [r["graph_ms"] for r in rows]
     b1 = ax.bar(x - w / 2, eager, w, color=SLATE, label="Eager step", zorder=2)
@@ -619,28 +720,123 @@ def plot_decode(D) -> None:
     for bars, vals in ((b1, eager), (b2, graph)):
         for rect, v in zip(bars, vals):
             ax.text(rect.get_x() + rect.get_width() / 2, v + 0.07, f"{v:.2f}",
-                    ha="center", va="bottom", fontsize=8.5, color=INK, fontweight="semibold")
+                    ha="center", va="bottom", fontsize=11, color=INK, fontweight="semibold")
     for i, r in enumerate(rows):
-        ax.text(x[i] + w / 2, r["graph_ms"] + 0.36, f"{r['speedup']:.1f}×",
-                ha="center", va="bottom", fontsize=8.4, color=BLUE)
+        ax.text(x[i] + w / 2, r["graph_ms"] + 0.42, f"{r['speedup']:.1f}×",
+                ha="center", va="bottom", fontsize=11, color=BLUE, fontweight="semibold")
 
     _style(ax)
     ax.set_xticks(x)
     ax.set_xticklabels([f"d_state = {r['d_state']}" for r in rows])
     ax.set_ylabel("Per-frame latency  (ms)")
-    ax.set_ylim(0, max(eager) * 1.22)
-    ax.legend(loc="upper left", fontsize=9)
+    ax.set_ylim(0, max(eager) * 1.26)
+    ax.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
     lo = min(r["speedup"] for r in rows)
     hi = max(r["speedup"] for r in rows)
     p_lo = min(r["pct_of_60fps"] for r in rows)
     p_hi = max(r["pct_of_60fps"] for r in rows)
     _heading(fig, "Single-step decode",
-             f"CUDA graph is {lo:.1f}–{hi:.1f}× faster than eager and uses "
-             f"{p_lo:.1f}–{p_hi:.1f}% of a 16.7 ms frame")
-    _footer(fig, f"{D['gpu']}  ·  3 layers, 67 joints, d_model=320  ·  "
-                 f"100 timed steps after 30 warmup")
+             f"CUDA graph is {lo:.1f}–{hi:.1f}× faster than eager, "
+             f"{p_lo:.1f}–{p_hi:.1f}% of a 16.7 ms frame", axes_title=False)
+    _footer(fig, f"{D['gpu']}  ·  fp32, 3 layers, 67 joints, d_model=320",
+            "100 timed steps after 30 warmup")
     _save(fig, "decode.png")
+
+
+def plot_stability(D) -> None:
+    rows, drift = D["stability_len"], D["decode_drift"]
+    fig, (ax_l, ax_d) = _stacked(height=7.3)
+
+    xs = [r["seqlen"] for r in rows]
+    ax_l.plot(xs, [r["err_y"] for r in rows], color=TEAL, marker="s", ms=6.0, label="Output Y")
+    ax_l.plot(xs, [r["err_h"] for r in rows], color=CORAL, lw=2.0, marker="o", ms=6.5,
+              mfc="white", mew=1.8, label="Final state h")
+    ax_l.axhline(1e-6, color=SLATE, lw=1.0, ls=(0, (3, 2)))
+    ax_l.text(xs[0], 1.2e-6, "1×10⁻⁶", color=MUTED, fontsize=10.5, va="bottom")
+    _style(ax_l, log=True)
+    ax_l.set_xscale("log", base=2)
+    ax_l.set_yscale("log")
+    ax_l.set_xticks(xs)
+    ax_l.set_xticklabels([f"{v // 1024}k" if v >= 1024 else str(v) for v in xs])
+    ax_l.set_ylim(1e-7, 3e-5)
+    ax_l.set_xlabel("Sequence length")
+    ax_l.set_ylabel("max |Δ|  vs recurrence")
+    ax_l.set_title("Chunked scan, L = 32 … 4k", loc="left")
+    ax_l.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.8)
+
+    err = np.maximum(np.asarray(drift["err"], dtype=float), 1e-12)
+    steps = np.arange(1, len(err) + 1)
+    running = np.maximum.accumulate(err)
+    ax_d.plot(steps, err, color="#C3C8D1", lw=0.8, label="per step")
+    ax_d.plot(steps, running, color=BLUE, label="running max")
+    ax_d.annotate(f"{running[-1]:.1e} after {len(err)} steps",
+                  (steps[-1], running[-1]), textcoords="offset points", xytext=(-8, -20),
+                  ha="right", va="top", color=BLUE, fontsize=11.5, fontweight="semibold")
+    _style(ax_d, log=True)
+    ax_d.set_yscale("log")
+    ax_d.set_ylim(2e-7, 6e-6)
+    ax_d.yaxis.set_minor_formatter(mticker.NullFormatter())
+    ax_d.set_xlim(0, len(err))
+    ax_d.set_xlabel("Decode step")
+    ax_d.set_ylabel("max |Δ|  vs full forward")
+    ax_d.set_title("Streaming step(), one state carried forward", loc="left")
+    ax_d.legend(loc="lower right", ncol=2, columnspacing=1.2, handlelength=1.8)
+
+    _heading(fig, "Error does not grow with length or with time",
+             "Chunking splits the same algebra, so a longer sequence adds no drift —",
+             "and neither does replaying a streaming state a thousand steps in a row")
+    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  top: B=3, H=4, P=16, N=32, chunk=64",
+            f"Bottom: B=2, d_model=128, N=32, P=32, {drift['steps']} consecutive steps")
+    _save(fig, "stability.png")
+
+
+def plot_long_context(D) -> None:
+    rows, meta = D["long_context"], D["long_context_params"]
+    xs = [r["seqlen"] for r in rows]
+    fig, (ax_t, ax_m) = _stacked(height=7.1, share_x=True)
+
+    def series(key):
+        return ([r["seqlen"] for r in rows if r[key] is not None],
+                [r[key] for r in rows if r[key] is not None])
+
+    for ax, kc, kr, ylabel, title in (
+        (ax_t, "chunked_ms", "recurrent_ms", "Fwd + bwd  (ms, log)", "Training step"),
+        (ax_m, "chunked_mb", "recurrent_mb", "Peak allocated  (MiB)", "Autograd footprint"),
+    ):
+        ax.plot(*series(kr), color=CORAL, lw=2.0, marker="o", ms=6.5, mfc="white", mew=1.8,
+                ls=(0, (3.2, 2.2)), label="Step-by-step recurrence")
+        ax.plot(*series(kc), color=TEAL, marker="s", ms=6.0, label="Chunked scan")
+        _style(ax, log=ax is ax_t)
+        ax.set_xscale("log", base=2)
+        if ax is ax_t:
+            ax.set_yscale("log")
+        else:
+            ax.set_ylim(0, 3900)
+            ax.yaxis.set_major_locator(mticker.MultipleLocator(1000))
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"{v // 1024}k" if v >= 1024 else str(v) for v in xs])
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, loc="left")
+        ax.legend(loc="upper left")
+    ax_m.set_xlabel("Sequence length")
+
+    last = rows[-1]
+    for ax, kc, kr, unit in ((ax_t, "chunked_ms", "recurrent_ms", "faster"),
+                             (ax_m, "chunked_mb", "recurrent_mb", "smaller")):
+        if last[kc] and last[kr]:
+            ax.annotate(f"{last[kr] / last[kc]:.0f}× {unit} at {last['seqlen'] // 1024}k",
+                        (last["seqlen"], last[kc]), textcoords="offset points",
+                        xytext=(-8, 12), ha="right", color=TEAL, fontsize=11.5,
+                        fontweight="semibold")
+
+    _heading(fig, "What makes long sequences trainable at all",
+             "Backprop through L Python steps is the wall a readable reference hits —",
+             "in wall-clock time and in the size of the autograd graph")
+    _footer(fig, f"{D['gpu']}  ·  fp32, B={meta['batch']}, H={meta['nheads']}, "
+                 f"P={meta['headdim']}, N={meta['d_state']}, chunk={meta['chunk_size']}",
+            "One zero_grad + forward + backward through the scan itself")
+    _save(fig, "long_context.png")
 
 
 def plot_all(D) -> None:
@@ -650,6 +846,8 @@ def plot_all(D) -> None:
     plot_training(D)
     plot_alignment(D)
     plot_decode(D)
+    plot_stability(D)
+    plot_long_context(D)
 
 
 def main() -> None:
