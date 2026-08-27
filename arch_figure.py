@@ -14,47 +14,33 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+from matplotlib.patches import FancyArrowPatch
+
+from figstyle import (BLUE, CORAL, INK, MUTED, NAVY, PLUM, TEAL, WIRE, card, lh,
+                      use_style)
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 ASSETS.mkdir(exist_ok=True)
 
-INK = "#1A1D23"
-MUTED = "#5C6370"
-TEAL = "#0F7B6C"
-CORAL = "#C45C26"
-NAVY = "#1E3A5F"
-BLUE = "#1D4ED8"
-PLUM = "#7C3AED"
-WIRE = "#98A2B3"
-
-FILL = {
-    NAVY: "#EDF1F7",
-    TEAL: "#E7F2F0",
-    CORAL: "#FBEEE6",
-    PLUM: "#F1EBFB",
-    BLUE: "#E9EEFC",
-}
-
-plt.rcParams.update({
-    "font.family": ["Segoe UI", "DejaVu Sans"],
-    "figure.facecolor": "white",
-    "savefig.dpi": 200,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.2,
-})
-
-# Both axes are in inches at 1:1, so rounded corners stay circular and text
-# sizes convert straight into layout space.
 AX_W = 6.0
 HEAD_H, FOOT_H = 0.56, 0.40
-RADIUS = 0.07
+RADIUS = 0.08
 MARGIN = 0.16
 
+# Columns, in inches from the left edge of the axes.
+X_IN = (0.50, 1.78)
+X_CHIP = (2.10, 3.50)
+X_SCAN = (3.82, 5.28)
+X_BYPASS = 5.66                                     # where z runs down
+X_GATE = (4.00, 5.10)                               # row 2, under the scan
+X_OUT = (2.31, 3.29)                                # row 2, under the branches
 
-def lh(size: float) -> float:
-    """Height of one line of text, in inches."""
-    return size * 1.34 / 72.0
+CHIPS = [
+    (TEAL, "x  \u2192  V", "the written values"),
+    (PLUM, "B, C  \u2192  K, Q", "norm, bias, RoPE"),
+    (CORAL, "dt, A, trap", "step size, decay"),
+]
+GAP_CHIP, GAP_Z, GAP_ROW = 0.09, 0.16, 0.42
 
 
 def box_h(title_size: float, n_lines: int, line_size: float, pad: float) -> float:
@@ -62,11 +48,7 @@ def box_h(title_size: float, n_lines: int, line_size: float, pad: float) -> floa
 
 
 def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=12.5, line_size=9.4):
-    ax.add_patch(FancyBboxPatch(
-        (x0, y0), x1 - x0, y1 - y0,
-        boxstyle=f"round,pad=0,rounding_size={RADIUS}",
-        linewidth=1.4, edgecolor=color, facecolor=FILL.get(color, "white"), zorder=2,
-    ))
+    card(ax, x0, y0, x1, y1, color, RADIUS)
     block = lh(title_size) + len(lines) * lh(line_size)
     y = y1 - (y1 - y0 - block) / 2 - lh(title_size) / 2
     ax.text((x0 + x1) / 2, y, title, ha="center", va="center", fontsize=title_size,
@@ -94,23 +76,8 @@ def elbow(ax, pts, color=WIRE):
     arrow(ax, *pts[-2], *pts[-1], color=color)
 
 
-# Columns, in inches from the left edge of the axes.
-X_IN = (0.50, 1.78)
-X_CHIP = (2.10, 3.50)
-X_SCAN = (3.82, 5.28)
-X_BYPASS = 5.66                                     # where z runs down
-X_GATE = (4.00, 5.10)                               # row 2, under the scan
-X_OUT = (2.31, 3.29)                                # row 2, under the branches
-
-CHIPS = [
-    (TEAL, "x  \u2192  V", "the written values"),
-    (PLUM, "B, C  \u2192  K, Q", "norm, bias, RoPE"),
-    (CORAL, "dt, A, trap", "step size, decay"),
-]
-GAP_CHIP, GAP_Z, GAP_ROW = 0.09, 0.16, 0.42
-
-
 def main() -> None:
+    use_style()
     z_h = box_h(12.0, 0, 9.4, 0.12)
     chip_h = box_h(12.0, 1, 9.4, 0.13)
     gate_h = box_h(12.5, 2, 9.4, 0.15)
