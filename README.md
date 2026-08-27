@@ -1,10 +1,31 @@
-# Mamba3
+<p align="center">
+  <img src="https://img.shields.io/badge/PyTorch-only-ee4c2c?style=flat-square" alt="PyTorch only">
+  <img src="https://img.shields.io/badge/CUDA-no%20nvcc-0f7b6c?style=flat-square" alt="No nvcc">
+  <img src="https://img.shields.io/badge/API-mamba__ssm-1e3a5f?style=flat-square" alt="Official API">
+  <img src="https://img.shields.io/badge/paper-arXiv%3A2603.15569-b31b1b?style=flat-square" alt="Paper">
+</p>
 
-Single-file [Mamba-3](https://arxiv.org/abs/2603.15569) with the official [`mamba_ssm`](https://github.com/state-spaces/mamba) API. PyTorch is the only dependency.
+<h1 align="center">Mamba3</h1>
 
-No nvcc, CUDA Toolkit, MSVC, Triton, TileLang, einops or `mamba-ssm`. A CUDA-enabled PyTorch build is enough for GPU acceleration.
+<p align="center">
+  Single-file <a href="https://arxiv.org/abs/2603.15569">Mamba-3</a>.
+  Official <a href="https://github.com/state-spaces/mamba"><code>mamba_ssm</code></a> API.
+  PyTorch is the only dependency.
+</p>
 
-This file replaces the official **kernel backend**, not the interface. Class names, arguments, attributes, state layouts and calling conventions match `mamba_ssm`, so the official docs apply as-is and weights are interchangeable.
+Drop [`mamba3.py`](mamba3.py) into a project. No nvcc, CUDA Toolkit, MSVC, Triton, TileLang, einops or `mamba-ssm`. A CUDA-enabled PyTorch build is enough for GPU acceleration.
+
+This file replaces the official **kernel backend**, not the interface. Names, arguments, attributes, state layouts and calling conventions match `mamba_ssm`, so the official docs apply as-is and weights are interchangeable.
+
+<table>
+  <tr>
+    <td align="center" width="33%"><strong>69.8×</strong><br><sub>SISO scan at L=512 vs recurrence</sub></td>
+    <td align="center" width="33%"><strong>0.50 ms</strong><br><sub>CUDA-graph decode, 67 joints, d_state=16</sub></td>
+    <td align="center" width="33%"><strong>≤ 10⁻⁶</strong><br><sub>max |Δ| vs a full forward, six layer configs</sub></td>
+  </tr>
+</table>
+
+---
 
 ## Install
 
@@ -12,17 +33,13 @@ This file replaces the official **kernel backend**, not the interface. Class nam
 pip install torch
 ```
 
-Drop [`mamba3.py`](mamba3.py) into your project and import it.
-
 ```python
 import torch
 from mamba3 import Mamba3, MixerModel, InferenceParams, update_graph_cache
 
-# One layer, drop-in replacement for self-attention: (B, L, D) -> (B, L, D)
 layer = Mamba3(d_model=256, d_state=64, headdim=64).cuda()
-y = layer(torch.randn(2, 128, 256, device="cuda"))
+y = layer(torch.randn(2, 128, 256, device="cuda"))          # (B, L, D) → (B, L, D)
 
-# A stack of layers for continuous features (no token embedding)
 model = MixerModel(256, n_layer=4, rms_norm=True,
                    ssm_cfg=dict(d_state=64, headdim=64)).cuda().eval()
 ```
@@ -31,14 +48,11 @@ SISO is the default. MIMO and the Mamba-3 extras use the same argument names as 
 
 ```python
 Mamba3(
-    d_model=256,
-    d_state=64,
-    headdim=64,
-    is_mimo=True,
-    mimo_rank=4,
-    chunk_size=16,          # 64 for SISO, 64 / mimo_rank for MIMO
+    d_model=256, d_state=64, headdim=64,
+    is_mimo=True, mimo_rank=4,
+    chunk_size=16,              # 64 for SISO, 64 / mimo_rank for MIMO
     is_outproj_norm=True,
-    rope_fraction=0.5,      # 0.5 or 1.0
+    rope_fraction=0.5,          # 0.5 or 1.0
 )
 ```
 
@@ -48,18 +62,81 @@ Mamba3(
 
 ```python
 params = InferenceParams(max_seqlen=1024, max_batch_size=2)
-y = model(x, inference_params=params)   # prefill
+y = model(x, inference_params=params)       # prefill
 params.seqlen_offset += x.shape[1]
 
-# Single-step decode (eager)
 token = torch.randn(2, 1, 256, device="cuda")
-y_t = model(token, inference_params=params)
+y_t = model(token, inference_params=params) # eager decode
 params.seqlen_offset += 1
 
-# Single-step decode (CUDA graph): one launch for the whole stack
 cache = update_graph_cache(model, None, batch_size=2, seqlen_og=0, max_seqlen=1024)
-y_t = cache.run(token)
+y_t = cache.run(token)                      # one launch for the whole stack
 ```
+
+---
+
+## Alignment with official
+
+This file replaces the official kernel backend. Official fused kernels (Triton SISO / TileLang MIMO) are **not** compared: they need `mamba-ssm` plus nvcc / Triton / TileLang, which this file is written to avoid.
+
+What *is* checked, on an RTX 4090 / PyTorch 2.12.1+cu132, TF32 off:
+
+| | Compared against | max \|Δ\| |
+|---|---|---:|
+| Chunked scan, R = 1 / 2 / 4 | Step-by-step recurrence (Y, final state) | ≤ 5.7×10⁻⁶ |
+| Chunked-scan gradients | Same recurrence, d(Y,h)/d(V,K,Q,ADT,α,β) | ≤ 1.8×10⁻⁴ &nbsp;·&nbsp; rel. ~2×10⁻⁷ |
+| Segmented `inference_params` | One full forward | ≤ 7.2×10⁻⁷ |
+| Official `step()` path | One full forward | ≤ 1.3×10⁻⁶ |
+| CUDA graph, then after reset | Eager decode | 4.8×10⁻⁷ &nbsp;/&nbsp; 7.5×10⁻⁹ |
+| State shapes, B/C bias, `in_proj`, RoPE, `Block`, `rms_norm_ref` | `mamba_ssm` conventions | match |
+
+Two deviations are intentional — the official counterparts are language-model only:
+
+- **`MixerModel` drops the embedding.** This stack takes `(batch, seqlen, d_model)` features directly.
+- **`capture_graph` uses `hidden_states`.** Official static buffers are `input_ids` / `position_ids`.
+
+Everything else follows the official code line by line. Not implemented: `cu_seqlens`, `seq_idx`, tensor parallelism, kernel-level fusion.
+
+<p align="center">
+  <img src="assets/alignment.png" width="920" alt="Numerical agreement with a full forward">
+</p>
+
+---
+
+## Benchmarks
+
+Chunked parallel scan vs the step-by-step recurrence. Recurrent time grows linearly with `L`; chunked time stays around 1 ms because the inner work is cuBLAS GEMMs.
+
+<p align="center">
+  <img src="assets/scan.png" width="920" alt="Selective scan: time and speedup">
+</p>
+
+| | L=32 | L=64 | L=128 | L=256 | L=512 |
+|---|---:|---:|---:|---:|---:|
+| SISO chunked | 0.66 ms | 0.67 ms | 0.69 ms | 0.74 ms | 0.81 ms |
+| SISO vs recurrence | 5.5× | 10.8× | 20.8× | 38.7× | **69.8×** |
+| MIMO(R=2) chunked | 0.68 ms | 0.72 ms | 0.76 ms | 0.84 ms | 1.04 ms |
+| MIMO(R=2) vs recurrence | 6.4× | 12.0× | 22.5× | 40.6× | **65.8×** |
+
+Single-step decode in the streaming-pose setting: 3 layers, 67 joints, `d_model=320`. CUDA graph removes kernel-launch overhead. Both stay far below a 16.7 ms / 60 FPS frame.
+
+<p align="center">
+  <img src="assets/decode.png" width="780" alt="Eager vs CUDA-graph decode">
+</p>
+
+| `d_state` | Eager | CUDA graph | Speedup | of 60 FPS |
+|---:|---:|---:|---:|---:|
+| 16 | 3.31 ms | **0.50 ms** | 6.6× | 3.0% |
+| 32 | 3.41 ms | **0.55 ms** | 6.2× | 3.3% |
+| 64 | 3.48 ms | **0.76 ms** | 4.6× | 4.5% |
+
+```bash
+python test_mamba3.py
+```
+
+Re-runs the numerical checks and prints the same class of benchmarks if CUDA is available.
+
+---
 
 ## API map
 
@@ -80,33 +157,22 @@ y_t = cache.run(token)
 | `utils.generation.capture_graph` | `capture_graph` |
 | `utils.generation.update_graph_cache` | `update_graph_cache` |
 
-## Deviations
-
-Two changes, both because the official counterparts are language-model only and have no non-LM version to follow:
-
-- **`MixerModel` drops the embedding.** Official code maps `input_ids` through a lookup. This stack takes `(batch, seqlen, d_model)` features directly.
-- **`capture_graph` uses `hidden_states`.** Official static buffers are `input_ids` / `position_ids`. Here they are `(batch, decoding_seqlen, d_model)`.
-
-Everything else follows the official code line by line.
-
-Not implemented: variable-length sequences (`cu_seqlens`), `seq_idx`, tensor parallelism, kernel-level operator fusion.
-
 ## Implementation notes
 
 **Chunked parallel scan.** Unrolling the linear recurrence gives
 
 ```
-h_t = exp(cs_t) · h_{-1} + Σ_{s≤t} exp(cs_t - cs_s) · u_s,
+h_t = exp(cs_t) · h_{-1} + Σ_{s≤t} exp(cs_t - cs_s) · u_s ,
 cs_t = Σ_{k≤t} A_k · dt_k
 ```
 
-Split into chunks of length `Q`: every `(i, j)` pair inside a chunk is one matmul, and only `L/Q` states move serially across chunks. The bulk of the work is cuBLAS GEMMs and stays differentiable end to end. Training uses this path; decoding uses the step-by-step recurrence.
+Split into chunks of length `Q`: every `(i, j)` pair inside a chunk is one matmul, and only `L/Q` states move serially. Training uses this path; decoding uses the step-by-step recurrence.
 
-**CUDA graph decoding.** Single-step decode is almost pure kernel-launch overhead. `capture_graph` records the whole call chain into one graph that replays with a single submission. States are updated in place with `copy_`, so a replay reads and writes the addresses fixed at capture time.
+**CUDA graph decoding.** Single-step decode is almost pure kernel-launch overhead. `capture_graph` records the whole call chain into one graph. States update in place with `copy_`, so a replay reads and writes the addresses fixed at capture time.
 
-**No einops.** On this path Python itself is hot, and `rearrange` pattern parsing showed up as about +10.8% on eager single-step. The file uses `reshape` / `permute` / `einsum` throughout.
+**No einops.** On this path Python itself is hot; `rearrange` pattern parsing measured +10.8% on eager single-step. The file uses `reshape` / `permute` / `einsum`.
 
-## Mamba-3 vs Mamba-2
+### Mamba-3 vs Mamba-2
 
 1. **Exponential-trapezoidal discretization**
 
@@ -114,69 +180,17 @@ Split into chunks of length `Q`: every `(i, j)` pair inside a chunk is one matmu
    h_t = exp(A·dt_t)·h_{t-1} + dt_t·[(1-tr_t)·Bx_t + tr_t·(Bx_t + Bx_{t-1})/2]
    ```
 
-   `tr_t` is a learnable sigmoid gate: `tr=0` is Euler/ZOH, `tr=1` is full trapezoidal integration. Equivalent to `u_t = alpha_t·Bx_t + beta_t·Bx_{t-1}` with `alpha_t = dt_t·(1 - tr_t/2)` and `beta_t = dt_t·tr_t/2`, which keeps the recurrence linear in `(X, B)` and is what makes the parallel rewrite above possible.
+   `tr_t` is a learnable sigmoid gate: `tr=0` is Euler/ZOH, `tr=1` is full trapezoidal integration. Equivalent to `u_t = α_t·Bx_t + β_t·Bx_{t-1}` with `α_t = dt_t·(1 - tr_t/2)` and `β_t = dt_t·tr_t/2`, which keeps the recurrence linear in `(X, B)`.
 
-2. **Complex (rotary) state space.** RoPE is applied to `B` / `C` with rotation angles scaled by `dt` and accumulated over time, so a real-valued state can express periodic dependencies such as counting and parity.
+2. **Complex (rotary) state space.** RoPE on `B` / `C`, angles scaled by `dt` and accumulated over time, so a real-valued state can express periodic dependencies.
 
-3. **MIMO.** A rank-`R` projection turns the state write from an outer product into a matrix multiply, raising arithmetic intensity. The persistent state is always `(B, H, P, N)`; `R` appears only on the read/write paths, never in `ssm_state`.
-
-Tensor notation (same as the official kernels):
+3. **MIMO.** A rank-`R` projection turns the state write into a matmul. Persistent state stays `(B, H, P, N)`; `R` appears only on the read/write paths.
 
 ```
 B batch | L seqlen | H nheads | P headdim | N d_state
-G num_bc_heads (ngroups) | R mimo_rank | S num_rope_angles
+G num_bc_heads | R mimo_rank | S num_rope_angles
 Q = C readout | K = B write | V = x values
 ```
-
-## Alignment with official
-
-This file replaces the official **kernel backend**, not the interface. Names, arguments, attributes, state layouts and calling conventions match [`mamba_ssm`](https://github.com/state-spaces/mamba) (see the API map above). Official fused kernels (Triton SISO / TileLang MIMO) are not compared here: they need `mamba-ssm` plus nvcc / Triton / TileLang, which this file is written to avoid.
-
-What is checked, on RTX 4090 / PyTorch 2.12.1+cu132, TF32 off for the numerical tests:
-
-| Check | What it compares | Result |
-|---|---|---|
-| Chunked scan vs step-by-step recurrence | Forward Y / final state, ranks R=1,2,4 | max\|Δ\| ≤ 5.7×10⁻⁶ |
-| Chunked scan vs recurrence | Gradients of (Y, h) w.r.t. V,K,Q,ADT,α,β | max\|Δ\| ≤ 1.8×10⁻⁴, relative ~2×10⁻⁷ |
-| Segmented `inference_params` resume | Concatenated segments vs one full forward | max\|Δ\| ≤ 7.2×10⁻⁷ |
-| Official `step()` path | Token-by-token decode vs one full forward | max\|Δ\| ≤ 1.3×10⁻⁶ |
-| CUDA graph vs eager | 10-frame decode, then after `initialize_states` | max\|Δ\| = 4.8×10⁻⁷ / 7.5×10⁻⁹ |
-| Official conventions | `allocate_inference_cache` shapes, B/C bias layout, `in_proj` width, RoPE split, `Block` return, `rms_norm_ref` | match `mamba_ssm` |
-
-The two documented deviations (`MixerModel` without embedding, `capture_graph` on `hidden_states`) are intentional; everything else follows the official code line by line.
-
-![Layer-level agreement with a full forward](assets/alignment.png)
-
-## Benchmarks
-
-Chunked parallel scan vs the step-by-step recurrence (the training / prefill path vs a Python recurrence). Recurrent time grows linearly with `L`; chunked time stays ~1 ms because the inner work is GEMMs.
-
-![Selective scan: recurrent vs chunked](assets/scan.png)
-
-![Chunked scan speedup vs sequence length](assets/scan_speedup.png)
-
-| Config | L=32 | L=64 | L=128 | L=256 | L=512 |
-|---|---:|---:|---:|---:|---:|
-| SISO chunked (ms) | 0.66 | 0.67 | 0.69 | 0.74 | 0.81 |
-| SISO speedup | 5.5× | 10.8× | 20.8× | 38.7× | 69.8× |
-| MIMO(R=2) chunked (ms) | 0.68 | 0.72 | 0.76 | 0.84 | 1.04 |
-| MIMO(R=2) speedup | 6.4× | 12.0× | 22.5× | 40.6× | 65.8× |
-
-Single-step decode, 3 layers, batch = 67 joints, `d_model=320` — the streaming-pose setting. CUDA graph removes kernel-launch overhead; both stay far below 16.7 ms (60 FPS).
-
-![Eager vs CUDA-graph decode latency](assets/decode.png)
-
-| `d_state` | Eager (ms) | CUDA graph (ms) | Speedup | of 60 FPS |
-|---:|---:|---:|---:|---:|
-| 16 | 3.31 | 0.50 | 6.6× | 3.0% |
-| 32 | 3.41 | 0.55 | 6.2× | 3.3% |
-| 64 | 3.48 | 0.76 | 4.6× | 4.5% |
-
-```bash
-python test_mamba3.py
-```
-
-The script re-runs the numerical checks above and prints the same class of benchmarks if CUDA is available.
 
 ## Citation
 
