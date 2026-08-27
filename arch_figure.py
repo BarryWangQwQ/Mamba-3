@@ -23,7 +23,7 @@ CORAL = "#C45C26"
 NAVY = "#1E3A5F"
 BLUE = "#1D4ED8"
 PLUM = "#7C3AED"
-SLATE = "#94A3B8"
+WIRE = "#98A2B3"
 
 FILL = {
     NAVY: "#EDF1F7",
@@ -41,30 +41,33 @@ plt.rcParams.update({
     "savefig.pad_inches": 0.24,
 })
 
-FIG_W, FIG_H = 9.2, 4.7
-TOP, BOTTOM = 0.865, 0.105
-# The canvas is 0..100 in both directions, so a font size has to be converted
-# into vertical units before text can be stacked.
-U_PER_PT = 100.0 / (FIG_H * (TOP - BOTTOM) * 72.0)
+FIG_W, FIG_H = 9.2, 4.2
+TOP, BOTTOM = 0.872, 0.104
 
-SPINE = 60.0          # vertical centre of the main flow
-LANE = 12.0           # the z bypass runs along here
+# x runs 0..100. y is scaled so that one unit is the same physical length on
+# both axes — otherwise rounded corners come out as stretched ellipses.
+AX_W, AX_H = FIG_W, FIG_H * (TOP - BOTTOM)
+YMAX = 100.0 * AX_H / AX_W
+PT = 100.0 / (AX_W * 72.0)          # one typographic point, in canvas units
+RADIUS = 1.05                       # corner radius, same units
 
 
 def line_h(size: float) -> float:
-    return size * 1.34 * U_PER_PT
+    return size * 1.34 * PT
 
 
-def box(ax, x0, x1, height, color, title, *lines, center=SPINE,
-        title_size=13.0, line_size=9.8):
-    y0, y1 = center - height / 2, center + height / 2
+def block_h(title_size: float, n_lines: int, line_size: float, pad: float) -> float:
+    return line_h(title_size) + n_lines * line_h(line_size) + pad
+
+
+def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=12.5, line_size=9.4):
     ax.add_patch(FancyBboxPatch(
-        (x0, y0), x1 - x0, height,
-        boxstyle="round,pad=0,rounding_size=2.0",
-        linewidth=1.6, edgecolor=color, facecolor=FILL.get(color, "white"), zorder=2,
+        (x0, y0), x1 - x0, y1 - y0,
+        boxstyle=f"round,pad=0,rounding_size={RADIUS}",
+        linewidth=1.5, edgecolor=color, facecolor=FILL.get(color, "white"), zorder=2,
     ))
     block = line_h(title_size) + len(lines) * line_h(line_size)
-    y = y1 - (height - block) / 2 - line_h(title_size) / 2
+    y = y1 - (y1 - y0 - block) / 2 - line_h(title_size) / 2
     ax.text((x0 + x1) / 2, y, title, ha="center", va="center", fontsize=title_size,
             fontweight="semibold", color=color, zorder=3)
     prev = title_size
@@ -75,17 +78,17 @@ def box(ax, x0, x1, height, color, title, *lines, center=SPINE,
                 color=MUTED, zorder=3)
 
 
-def arrow(ax, x0, y0, x1, y1, color=SLATE):
+def arrow(ax, x0, y0, x1, y1, color=WIRE):
     ax.add_patch(FancyArrowPatch(
-        (x0, y0), (x1, y1), arrowstyle="-|>", mutation_scale=12, linewidth=1.5,
-        color=color, shrinkA=0, shrinkB=0, zorder=1,
+        (x0, y0), (x1, y1),         arrowstyle="-|>", mutation_scale=11, linewidth=1.4,
+        color=color, shrinkA=0, shrinkB=0, zorder=1, clip_on=False,
     ))
 
 
-def elbow(ax, pts, color=SLATE):
-    """Polyline with an arrow head at the end."""
+def elbow(ax, pts, color=WIRE):
+    """Axis-aligned polyline, arrow head on the final segment."""
     for (x0, y0), (x1, y1) in zip(pts, pts[1:-1]):
-        ax.plot([x0, x1], [y0, y1], color=color, lw=1.5, zorder=1,
+        ax.plot([x0, x1], [y0, y1], color=color, lw=1.4, zorder=1,
                 solid_capstyle="round")
     arrow(ax, *pts[-2], *pts[-1], color=color)
 
@@ -93,58 +96,86 @@ def elbow(ax, pts, color=SLATE):
 def main() -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
     ax.set_xlim(0, 100)
-    ax.set_ylim(0, 100)
+    ax.set_ylim(0, YMAX)
     ax.axis("off")
     fig.subplots_adjust(left=0, right=1, top=TOP, bottom=BOTTOM)
 
-    ax.text(2.5, SPINE, "u", ha="right", va="center", fontsize=13.0,
-            fontweight="semibold", color=INK)
-    ax.text(2.5, SPINE - 9, "(B, L, D)", ha="right", va="center", fontsize=9.4,
-            color=MUTED)
-    arrow(ax, 4, SPINE, 8.6, SPINE)
-
-    box(ax, 9, 21, 30, NAVY, "in_proj", "one fused", "Linear, no bias")
-
     chips = [
-        (TEAL, "x  →  V", "the written values", 88.5),
-        (PLUM, "B, C  →  K, Q", "norm, bias, RoPE", 60.0),
-        (CORAL, "dt, A, trap", "step size, decay", 31.5),
+        (TEAL, "x  →  V", "the written values"),
+        (PLUM, "B, C  →  K, Q", "norm, bias, RoPE"),
+        (CORAL, "dt, A, trap", "step size, decay"),
     ]
-    for color, title, sub, cy in chips:
-        arrow(ax, 21, SPINE, 26.6, cy)
-        box(ax, 27, 43, 23, color, title, sub, center=cy, title_size=12.0,
-            line_size=9.4)
-        arrow(ax, 43, cy, 48.6, SPINE)
+    chip_h = block_h(12.0, 1, 9.4, 2.0)
+    chip_gap = 1.35
+    z_h = block_h(12.0, 0, 9.4, 2.0)
+    z_gap = 2.5
 
-    box(ax, 49, 66, 40, NAVY, "selective scan",
-        "chunked for prefill", "one step for decode")
-    arrow(ax, 66, SPINE, 70.6, SPINE)
+    # Centre the whole drawing vertically.
+    content = 3 * chip_h + 2 * chip_gap + z_gap + z_h
+    top = (YMAX + content) / 2
+    chips_bot = top - 3 * chip_h - 2 * chip_gap
+    z_top = chips_bot - z_gap
+    z_bot = z_top - z_h
+    spine = (top + chips_bot) / 2
 
-    box(ax, 71, 83, 30, NAVY, "gate by z", "optional", "RMSNorm first")
-    arrow(ax, 83, SPINE, 87.6, SPINE)
+    # Columns
+    X_IN = (9.0, 21.0)
+    X_CHIP = (26.0, 44.0)
+    X_SCAN = (49.0, 66.0)
+    X_GATE = (70.5, 81.5)
+    X_OUT = (86.0, 97.0)
 
-    box(ax, 88, 99, 30, NAVY, "out_proj")
-    arrow(ax, 99, SPINE, 103.6, SPINE)
-    ax.text(105, SPINE, "out", ha="left", va="center", fontsize=13.0,
+    ax.text(2.4, spine + 1.1, "u", ha="right", va="center", fontsize=13.0,
             fontweight="semibold", color=INK)
-    ax.text(105, SPINE - 9, "(B, L, D)", ha="left", va="center", fontsize=9.4,
+    ax.text(2.4, spine - 1.9, "(B, L, D)", ha="right", va="center", fontsize=9.2,
             color=MUTED)
+    arrow(ax, 3.8, spine, X_IN[0] - 0.6, spine)
 
-    # z leaves in_proj, bypasses the scan and meets the flow again at the gate.
-    box(ax, 27, 43, 17, BLUE, "z", center=LANE, title_size=12.0)
-    elbow(ax, [(15, 45), (15, LANE), (26.6, LANE)], color=BLUE)
-    elbow(ax, [(43, LANE), (77, LANE), (77, 45)], color=BLUE)
+    box(ax, *X_IN, z_bot, top, NAVY, "in_proj", "one fused Linear", "no bias")
+
+    for i, (color, title, sub) in enumerate(chips):
+        y1 = top - i * (chip_h + chip_gap)
+        y0 = y1 - chip_h
+        cy = (y0 + y1) / 2
+        arrow(ax, X_IN[1], cy, X_CHIP[0] - 0.6, cy)
+        box(ax, *X_CHIP, y0, y1, color, title, sub, title_size=12.0)
+        arrow(ax, X_CHIP[1], cy, X_SCAN[0] - 0.6, cy)
+
+    box(ax, *X_SCAN, chips_bot, top, NAVY, "selective scan",
+        "chunked for prefill", "one step for decode")
+    arrow(ax, X_SCAN[1], spine, X_GATE[0] - 0.6, spine)
+
+    gate_h = block_h(12.5, 2, 9.4, 2.2)
+    box(ax, *X_GATE, spine - gate_h / 2, spine + gate_h / 2, NAVY, "gate by z",
+        "optional", "RMSNorm first")
+    arrow(ax, X_GATE[1], spine, X_OUT[0] - 0.6, spine)
+
+    out_h = block_h(12.5, 0, 9.4, 2.2)
+    box(ax, *X_OUT, spine - out_h / 2, spine + out_h / 2, NAVY, "out_proj")
+    arrow(ax, X_OUT[1], spine, X_OUT[1] + 3.8, spine)
+    ax.text(X_OUT[1] + 5.2, spine + 1.1, "out", ha="left", va="center", fontsize=13.0,
+            fontweight="semibold", color=INK)
+    ax.text(X_OUT[1] + 5.2, spine - 1.9, "(B, L, D)", ha="left", va="center",
+            fontsize=9.2, color=MUTED)
+
+    # z leaves in_proj, bypasses the scan, and meets the flow again at the gate.
+    z_cy = (z_top + z_bot) / 2
+    gate_cx = (X_GATE[0] + X_GATE[1]) / 2
+    box(ax, *X_CHIP, z_bot, z_top, BLUE, "z", title_size=12.0)
+    arrow(ax, X_IN[1], z_cy, X_CHIP[0] - 0.6, z_cy, color=BLUE)
+    elbow(ax, [(X_CHIP[1], z_cy), (gate_cx, z_cy), (gate_cx, spine - gate_h / 2 - 0.6)],
+          color=BLUE)
 
     fig.text(0.0, 0.99, "One Mamba-3 layer", fontsize=15.5, fontweight="semibold",
              color=INK, va="top")
     fig.text(0.0, 0.945, "Exponential-trapezoidal discretization and a rotary state "
-                         "space, in the order mamba3.py runs them.", fontsize=10.8,
+                         "space, in the order mamba3.py runs them.", fontsize=10.6,
              color=MUTED, va="top")
-    fig.text(0.0, 0.055, "Decode carries one fixed-size state per layer: "
+    fig.text(0.0, 0.072, "Decode carries one fixed-size state per layer: "
                          "ssm (B, H, P, N), plus k, v and the accumulated RoPE angle.",
-             fontsize=9.6, color=MUTED, va="top")
-    fig.text(0.0, 0.008, "B batch  ·  H heads  ·  P headdim  ·  N d_state",
-             fontsize=9.6, color=MUTED, va="top")
+             fontsize=9.5, color=MUTED, va="top")
+    fig.text(0.0, 0.018, "B batch  ·  H heads  ·  P headdim  ·  N d_state",
+             fontsize=9.5, color=MUTED, va="top")
 
     fig.savefig(ASSETS / "architecture.png")
     plt.close(fig)
