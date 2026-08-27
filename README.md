@@ -13,6 +13,10 @@
   pure PyTorch, no kernels to build.
 </p>
 
+<p align="center">
+  <img src="assets/architecture.png" width="580" alt="The data path of one Mamba-3 layer">
+</p>
+
 Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you have Mamba-3 running on the GPU: SISO and MIMO, chunked prefill, single-step decode, CUDA-graph replay, gradients included.
 
 **Nothing to compile.** No nvcc, no CUDA Toolkit, no MSVC, no Triton, no TileLang, no einops, no `mamba-ssm`. A CUDA-enabled PyTorch build is the entire dependency list — which is what makes this work on Windows, inside a locked-down container, or on a cluster where you cannot install a toolchain.
@@ -225,6 +229,7 @@ Autograd runs straight through the chunked scan — no custom backward, no recom
 ```bash
 python test_mamba3.py      # numerical self-checks + benchmarks
 python bench_figures.py    # re-measure and redraw every figure above
+python arch_figure.py      # redraw the diagram at the top
 ```
 
 `bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU.
