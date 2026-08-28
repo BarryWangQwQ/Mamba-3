@@ -24,7 +24,7 @@ Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you ha
 
 **Any device PyTorch has.** The math is ordinary PyTorch ops and the runtime calls around graph capture go through `torch.accelerator`, so there is no vendor-specific path to fall off. The file follows PyTorch to whatever device it supports, CPU included — and CPU is not a degraded mode: given the same weights, forward, backward and decode land within ~3×10⁻⁶ of CUDA in fp32.
 
-**Not a lookalike.** This file replaces the official *kernel backend*, not the interface. Module names, arguments, attributes, state layouts and calling conventions follow `mamba_ssm` exactly, and parameter names line up one-to-one with the official modules — so upstream code and docs apply to it unchanged.
+**Not a lookalike.** What this file replaces is the official *kernel backend*, not the interface — which is why [the official usage snippet](#install) runs on it with only its import line changed.
 
 <p align="center">
   <img src="assets/headline.png" width="560" alt="70x faster scan, 0.075 ms compiled decode, 247x smaller state, 1.1e-6 max error">
