@@ -38,36 +38,49 @@ Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you ha
 pip install torch
 ```
 
+The usage example from the official README runs here as written — the import line is the only edit:
+
 ```python
 import torch
-from mamba3 import Mamba3, MixerModel, InferenceParams, update_graph_cache
+from mamba3 import Mamba3          # was: from mamba_ssm import Mamba3
 
-device = torch.accelerator.current_accelerator()            # cuda / xpu / mps; None on CPU
+batch, length, dim = 2, 2048, 768
+x = torch.randn(batch, length, dim).to(torch.bfloat16).to("cuda")
+model = Mamba3(
+    # This module uses roughly 6 * d_model^2 parameters
+    d_model=dim,            # Model dimension d_model
+    d_state=128,            # SSM state size
+    headdim=64,             # SSM headdim
+    is_mimo=True,           # Use MIMO mode
+    mimo_rank=4,            # MIMO rank when is_mimo=True
+    chunk_size=16,          # 64/mimo_rank if x is in bf16, else 32/mimo_rank
+    is_outproj_norm=False,  # Additional post SSM norm
+    dtype=torch.bfloat16,
+).to("cuda")
+y = model(x)
+assert y.shape == x.shape
+```
 
-layer = Mamba3(d_model=256, d_state=64, headdim=64).to(device)
-y = layer(torch.randn(2, 128, 256, device=device))          # (B, L, D) → (B, L, D)
+That snippet is the shortest description of this project: same class, same arguments, same defaults, backward included, and nothing to build. Arguments it does not show (`rope_fraction`, `ngroups`, `expand`, `dt_min` …) are upstream's too.
 
+`"cuda"` is just what upstream wrote. Any device PyTorch has will do — `torch.accelerator.current_accelerator()` returns the one it picked, and plain CPU is fine.
+
+## Prefill, decode, graph capture
+
+Full sequences go through `forward`, as above. For a stack of layers with a state to carry between calls, `MixerModel` is the official container, `Mamba3` inside a residual `Block`:
+
+```python
+from mamba3 import MixerModel, InferenceParams, update_graph_cache
+
+device = torch.accelerator.current_accelerator()
 model = MixerModel(256, n_layer=4, rms_norm=True,
                    ssm_cfg=dict(d_state=64, headdim=64)).to(device).eval()
 ```
 
-SISO is the default. MIMO and the Mamba-3 extras use the same argument names as upstream:
-
-```python
-Mamba3(
-    d_model=256, d_state=64, headdim=64,
-    is_mimo=True, mimo_rank=4,
-    chunk_size=16,              # 64 for SISO, 64 / mimo_rank for MIMO
-    is_outproj_norm=True,
-    rope_fraction=0.5,          # 0.5 or 1.0
-)
-```
-
-## Prefill, decode, graph capture
-
 `inference_params` follows the official convention: `seqlen_offset == 0` is the chunked prefill; `seqlen_offset > 0` and `seqlen == 1` is single-step decode. Segmented forwards resume from the cached state.
 
 ```python
+x = torch.randn(2, 512, 256, device=device)
 params = InferenceParams(max_seqlen=1024, max_batch_size=2)
 y = model(x, inference_params=params)       # prefill
 params.seqlen_offset += x.shape[1]
@@ -119,6 +132,7 @@ RTX 4090, PyTorch 2.12.1+cu132, fp32, TF32 off:
 | Compiled + replayed, 32 steps | Eager decode, output and SSM state | ≤ 9.6×10⁻⁷ |
 | CPU, same weights | CUDA forward / backward / decode | ≤ 3.4×10⁻⁶ |
 | State shapes, B/C bias, `in_proj`, RoPE, `Block`, `rms_norm_ref` | `mamba_ssm` conventions | match |
+| Official usage snippet | Run verbatim, one import aside | runs |
 
 </div>
 
