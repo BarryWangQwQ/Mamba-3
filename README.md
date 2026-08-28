@@ -151,7 +151,7 @@ Everything else follows the official code line by line. Not implemented: `cu_seq
 
 ## Benchmarks
 
-Same machine as above. Every number and figure comes from `python bench_figures.py`.
+Same machine as above. Every number and figure comes from `python scripts/bench_figures.py`.
 
 Each timing is the median of five timed blocks after warmup. Most calls here are launch bound and land near a millisecond, where a single block moves by more than 20% from GPU clock drift alone — enough to read as a regression that is not in the code. What survives the median is drift on a scale of tens of seconds, so treat the last digit of a ~1 ms reading as ±10% and compare orders of magnitude, not third digits.
 
@@ -253,13 +253,13 @@ Autograd runs straight through the chunked scan — no custom backward, no recom
 ### Reproducing
 
 ```bash
-python test_mamba3.py      # numerical self-checks + benchmarks
-python bench_figures.py    # re-measure and redraw every figure above
-python arch_figure.py      # redraw the diagram at the top
-python stats_figure.py     # redraw the headline numbers
+python scripts/test_mamba3.py      # numerical self-checks + benchmarks
+python scripts/bench_figures.py    # re-measure and redraw every figure above
+python scripts/arch_figure.py      # redraw the diagram at the top
+python scripts/stats_figure.py     # redraw the headline numbers
 ```
 
-`bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU.
+`scripts/bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU. Nothing under `scripts/` is needed to use the library — it is there to check the numbers and draw the figures. The root holds one file, and that file is the whole thing.
 
 ---
 

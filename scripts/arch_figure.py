@@ -6,7 +6,7 @@ formulas live in the README and in the code. Only matplotlib is needed.
 The flow wraps onto a second row to keep the figure close to square, so the
 labels stay legible when a phone scales the image down to its column width.
 
-    python arch_figure.py
+    python scripts/arch_figure.py
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from matplotlib.patches import FancyArrowPatch
 from figstyle import (BLUE, CORAL, INK, MUTED, NAVY, PLUM, TEAL, WIRE, card, lh,
                       use_style)
 
-ASSETS = Path(__file__).resolve().parent / "assets"
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
 ASSETS.mkdir(exist_ok=True)
 
 AX_W = 6.0
@@ -52,7 +52,7 @@ def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=12.5, line_size=9.4
     block = lh(title_size) + len(lines) * lh(line_size)
     y = y1 - (y1 - y0 - block) / 2 - lh(title_size) / 2
     ax.text((x0 + x1) / 2, y, title, ha="center", va="center", fontsize=title_size,
-            fontweight="semibold", color=color, zorder=3)
+            fontweight="bold", color=color, zorder=3)
     prev = title_size
     for text in lines:
         y -= lh(prev) / 2 + lh(line_size) / 2
@@ -101,7 +101,7 @@ def main() -> None:
     row2 = chips_bot - GAP_ROW - gate_h / 2             # centre line of row 2
 
     ax.text(0.14, spine, "u", ha="right", va="center", fontsize=13.0,
-            fontweight="semibold", color=INK)
+            fontweight="bold", color=INK)
     arrow(ax, 0.22, spine, X_IN[0] - 0.04, spine)
     box(ax, *X_IN, chips_bot, z_top, NAVY, "in_proj", "one fused Linear", "no bias")
 
@@ -132,10 +132,10 @@ def main() -> None:
     box(ax, *X_OUT, row2 - out_h / 2, row2 + out_h / 2, NAVY, "out_proj")
     arrow(ax, X_OUT[0], row2, X_OUT[0] - 0.32, row2)
     ax.text(X_OUT[0] - 0.40, row2, "out", ha="right", va="center", fontsize=13.0,
-            fontweight="semibold", color=INK)
+            fontweight="bold", color=INK)
 
     fig.text(0.0, 1.0 - 0.05 / fig_h, "One Mamba-3 layer", fontsize=15.0,
-             fontweight="semibold", color=INK, va="top")
+             fontweight="bold", color=INK, va="top")
     fig.text(0.0, 1.0 - 0.32 / fig_h, "The data path, in the order mamba3.py runs it.",
              fontsize=10.2, color=MUTED, va="top")
     fig.text(0.0, (FOOT_H - 0.06) / fig_h, "Decode keeps one fixed-size state per "

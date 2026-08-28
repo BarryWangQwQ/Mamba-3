@@ -8,7 +8,7 @@ here as literals so this script stays a drawing step:
     247x      assets/decode_scaling.png  state vs a 16k-token KV cache
     1.1e-6    assets/alignment.png       step() against one full forward
 
-    python stats_figure.py
+    python scripts/stats_figure.py
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 
 from figstyle import CORAL, MUTED, NAVY, PLUM, TEAL, card, lh, use_style
 
-ASSETS = Path(__file__).resolve().parent / "assets"
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
 ASSETS.mkdir(exist_ok=True)
 
 CARDS = [

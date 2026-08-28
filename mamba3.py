@@ -9,7 +9,7 @@ to build and no backend to select: the compute is ordinary PyTorch ops, so it
 runs wherever PyTorch does. README.md covers the API map, the deviations from
 upstream, and the implementation notes.
 
-Self-check and benchmark: python test_mamba3.py
+Self-check and benchmark: python scripts/test_mamba3.py
 """
 
 from __future__ import annotations

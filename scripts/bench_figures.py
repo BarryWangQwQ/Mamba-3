@@ -1,7 +1,7 @@
 """Measure and plot the benchmark figures shown in README.md.
 
-    python bench_figures.py            # measure on GPU, then plot
-    python bench_figures.py --replot   # redraw from assets/results.json only
+    python scripts/bench_figures.py            # measure on GPU, then plot
+    python scripts/bench_figures.py --replot   # redraw from assets/results.json
 
 Writes assets/*.png and assets/results.json.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -20,6 +21,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+ROOT = Path(__file__).resolve().parent.parent
+# python puts this file's directory on sys.path, not the one it was launched
+# from, so point at the repo root to reach mamba3.py.
+sys.path.insert(0, str(ROOT))
 
 from mamba3 import (
     InferenceParams,
@@ -31,8 +37,7 @@ from mamba3 import (
     update_graph_cache,
 )
 
-HERE = Path(__file__).resolve().parent
-ASSETS = HERE / "assets"
+ASSETS = ROOT / "assets"
 ASSETS.mkdir(exist_ok=True)
 
 # --------------------------------------------------------------------------

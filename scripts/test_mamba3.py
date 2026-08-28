@@ -1,6 +1,6 @@
 """Numerical self-checks and benchmarks for mamba3.py.
 
-Run directly: python test_mamba3.py
+Run directly: python scripts/test_mamba3.py
 
 The self-checks cover:
   1. The chunked parallel scan agrees with the step-by-step recurrence in both
@@ -19,9 +19,15 @@ The self-checks cover:
 """
 
 import copy
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+# python puts this file's directory on sys.path, not the one it was launched
+# from, so point at the repo root to reach mamba3.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mamba3 import (
     Block,
