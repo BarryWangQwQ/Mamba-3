@@ -3,8 +3,8 @@
 Every figure is a reading of one of the plots further down the README, kept
 here as literals so this script stays a drawing step:
 
-    72x       assets/scan.png            speedup at L=512, R=1
-    0.51 ms   assets/decode.png          CUDA-graph decode, batch 64
+    70x       assets/scan.png            speedup at L=512, R=1
+    0.075 ms  assets/compile.png         compiled graph decode, batch 1
     247x      assets/decode_scaling.png  state vs a 16k-token KV cache
     1.1e-6    assets/alignment.png       step() against one full forward
 
@@ -23,8 +23,8 @@ ASSETS = Path(__file__).resolve().parent / "assets"
 ASSETS.mkdir(exist_ok=True)
 
 CARDS = [
-    (TEAL, "72\u00d7", "SISO scan at L=512, vs the recurrence"),
-    (NAVY, "0.51 ms", "CUDA-graph decode, batch 64"),
+    (TEAL, "70\u00d7", "SISO scan at L=512, vs the recurrence"),
+    (NAVY, "0.075 ms", "Compiled graph decode, batch 1"),
     (PLUM, "247\u00d7", "smaller than a 16k-token KV cache"),
     (CORAL, "\u2264 1.1\u00d710\u207b\u2076", "max |\u0394| vs a full forward"),
 ]
@@ -56,7 +56,7 @@ def main() -> None:
         cx = x0 + card_w / 2
         y = y1 - PAD / 2 - lh(NUM_SIZE) / 2
         ax.text(cx, y, number, ha="center", va="center", fontsize=NUM_SIZE,
-                fontweight="semibold", color=color, zorder=3)
+                fontweight="bold", color=color, zorder=3)
         y -= lh(NUM_SIZE) / 2 + lh(CAP_SIZE) / 2
         ax.text(cx, y, caption, ha="center", va="center", fontsize=CAP_SIZE,
                 color=MUTED, zorder=3)

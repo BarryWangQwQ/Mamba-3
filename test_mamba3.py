@@ -8,11 +8,17 @@ The self-checks cover:
      takes the recurrent one)
   2. Segmented resumption through inference_params, and the official step()
      path, both reproduce a single full-sequence forward
-  3. Key conventions line up with the official mamba_ssm: state shapes, bias
+  3. The decode step's dedicated single-token path is bit-identical to the
+     general scan evaluated at length one
+  4. Key conventions line up with the official mamba_ssm: state shapes, bias
      layouts, norm semantics, Block return values
-  4. CUDA graph decoding matches call-by-call forwards, and states can be reset
+  5. CPU and the accelerator agree, so no backend is a special case
+  6. Graph decoding matches call-by-call forwards, and states can be reset
      per sample
+  7. A torch.compile'd model still works through the graph cache, unchanged
 """
+
+import copy
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +30,8 @@ from mamba3 import (
     Mamba3,
     MixerModel,
     _chunk_scan,
+    _mamba3_combined,
+    _mamba3_step,
     _recurrent_scan,
     create_block,
     initialize_states,
@@ -135,6 +143,81 @@ def test_mamba3(device) -> None:
         assert e_seg < 2e-4 and e_step < 2e-4, f"{tag}: state path mismatch"
 
 
+def test_step_dedicated_path(device) -> None:
+    """Check the decode step's dedicated path against the general scan at L=1.
+
+    _mamba3_step drops the length axis _mamba3_combined carries, which is only
+    sound if it reorders no arithmetic: a cumsum over one element, a stack of one
+    tensor and a rank-one einsum are replaced by their values, not by anything
+    cheaper. So this asserts equality bit for bit, not within a tolerance.
+    """
+    variants = [
+        ("SISO", dict()),
+        ("SISO + outproj_norm", dict(is_outproj_norm=True)),
+        ("SISO + rope_fraction=1", dict(rope_fraction=1.0)),
+        ("MIMO(R=4)", dict(is_mimo=True, mimo_rank=4, chunk_size=16)),
+        ("MIMO(R=4) + norm", dict(is_mimo=True, mimo_rank=4, chunk_size=16,
+                                  is_outproj_norm=True)),
+        ("MIMO(R=4) unfused norm", dict(is_mimo=True, mimo_rank=4, chunk_size=16,
+                                        is_outproj_norm=True,
+                                        fuse_pregate_headwise_norm=False)),
+    ]
+
+    print("\n--- Decode step: dedicated path vs the general scan at L=1 ---")
+    for tag, overrides in variants:
+        m = Mamba3(d_model=128, d_state=32, headdim=32, layer_idx=0,
+                   **overrides).to(device).float()
+        batch = 3
+
+        with torch.no_grad():
+            states = m.allocate_inference_cache(batch, 8)
+            for s in states:  # non-zero, so the resume terms are exercised
+                s.normal_()
+            u = torch.randn(batch, m.d_model, device=device)
+
+            z, x, B, C, dd_dt, dd_A, trap, angles = m._split_in_proj(u)
+            DT, B, C, x, z, trap, A, angles = m._preprocess(
+                dd_A, dd_dt, B, C, x, z, trap, angles
+            )
+
+            if m.is_mimo:
+                gated = m.fuse_pregate_headwise_norm or not m.is_outproj_norm
+                shared = dict(
+                    rotate_pairwise=False, MIMO_V=m.mimo_x, MIMO_Z=m.mimo_z,
+                    MIMO_Out=m.mimo_o if gated else None,
+                    outproj_norm_weight=(
+                        m.norm.weight if m.fuse_pregate_headwise_norm else None),
+                    outproj_norm_eps=(
+                        m.norm.eps if m.fuse_pregate_headwise_norm else 1e-5),
+                )
+                Z = z if gated else None
+            else:
+                shared = dict(rotate_pairwise=True, MIMO_V=None, MIMO_Z=None,
+                              MIMO_Out=None, outproj_norm_weight=None,
+                              outproj_norm_eps=1e-5)
+                Z = z if not m.is_outproj_norm else None
+
+            got = _mamba3_step(
+                Q=C, K=B, V=x, ADT=A * DT, DT=DT, Trap=torch.logit(trap),
+                Q_bias=m.C_bias, K_bias=m.B_bias, Angles=angles, D=m.D, Z=Z,
+                Input_States=states, **shared,
+            )
+            ref = _mamba3_combined(
+                C.unsqueeze(1), B.unsqueeze(1), x.unsqueeze(1),
+                (A * DT).unsqueeze(-1), DT.unsqueeze(-1),
+                torch.logit(trap).unsqueeze(-1), m.C_bias, m.B_bias,
+                angles.unsqueeze(1), m.D, None if Z is None else Z.unsqueeze(1),
+                chunk_size=m.chunk_size, Input_States=states, **shared,
+            )
+            ref = (ref[0].squeeze(1),) + tuple(ref[1:])
+
+        exact = all(torch.equal(a, b) for a, b in zip(got, ref))
+        worst = max((a - b).abs().max().item() for a, b in zip(got, ref))
+        print(f"  {tag:<24} {'bit-identical' if exact else 'DIFFERS':<15} "
+              f"max|d| = {worst:.3e}")
+        assert exact, f"{tag}: dedicated decode path diverges from the general scan"
+
+
 def test_official_conventions(device) -> None:
     """Verify the parts that must agree with the official implementation."""
     print("\n--- Conventions shared with the official implementation ---")
@@ -211,10 +294,94 @@ def test_official_conventions(device) -> None:
     print("  rms_norm_ref: norm_before_gate=True semantics match the official one")
 
 
+def test_backend_parity(device) -> None:
+    """The same weights must give the same answers on CPU and on the accelerator."""
+    print("\n--- CPU vs accelerator: same file, same numbers ---")
+    if device.type == "cpu":
+        print("  skipped (no accelerator to compare against).")
+        return
+
+    torch.manual_seed(0)
+    ref = Mamba3(d_model=128, d_state=32, headdim=32, is_mimo=True, mimo_rank=2,
+                 layer_idx=0).float()
+    x0 = torch.randn(2, 64, 128)
+    token0 = torch.randn(2, 1, 128)
+
+    out = {}
+    for dev in (torch.device("cpu"), device):
+        layer = copy.deepcopy(ref).to(dev)
+        x = x0.clone().to(dev).requires_grad_(True)
+        y = layer(x)
+        y.sum().backward()
+        with torch.inference_mode():
+            params = InferenceParams(max_seqlen=128, max_batch_size=2)
+            layer(x0.to(dev), inference_params=params)
+            params.seqlen_offset = x0.shape[1]
+            step = layer(token0.to(dev), inference_params=params)
+        out[dev.type] = (y.detach().cpu(), x.grad.cpu(), step.cpu())
+
+    for i, name in enumerate(("forward", "backward", "decode step")):
+        a, b = out["cpu"][i], out[device.type][i]
+        err = (a - b).abs().max().item()
+        print(f"  {name:<12s} cpu vs {device.type} max|d| = {err:.3e}")
+        assert err < 1e-4, f"{name} disagrees across backends"
+
+
+def test_compiled_decode(device) -> None:
+    """A compiled model must pass through the graph cache and still match eager.
+
+    Nothing in mamba3.py mentions torch.compile: this guards that it stays that
+    way, i.e. that update_graph_cache keeps working on the OptimizedModule
+    wrapper rather than reaching past it.
+    """
+    print("\n--- torch.compile through the graph cache ---")
+    if device.type == "cpu":
+        print("  skipped (graph capture needs an accelerator).")
+        return
+    import torch._dynamo as dynamo
+    if not dynamo.is_inductor_supported():
+        print("  skipped (inductor unavailable here).")
+        return
+
+    def build():
+        torch.manual_seed(0)
+        return MixerModel(256, n_layer=3, rms_norm=True,
+                          ssm_cfg=dict(d_state=32, headdim=64)).to(device).eval().float()
+
+    batch, nsteps, max_seqlen = 4, 32, 64
+    torch.manual_seed(1)
+    frames = [torch.randn(batch, 1, 256, device=device) for _ in range(nsteps)]
+
+    with torch.inference_mode():
+        model = build()
+        params = InferenceParams(max_seqlen=max_seqlen, max_batch_size=batch)
+        ref = []
+        for x in frames:
+            ref.append(model(x, inference_params=params).clone())
+            params.seqlen_offset += 1
+        ref_state = [s[1].clone() for s in params.key_value_memory_dict.values()]
+
+        cache = update_graph_cache(torch.compile(build(), fullgraph=True), None,
+                                   batch, 0, max_seqlen)
+        got = [cache.run(x) for x in frames]
+        got_state = [s[1].clone()
+                     for s in cache.inference_params.key_value_memory_dict.values()]
+
+    # Checked after a run of steps, not one, because a decode error small enough
+    # to pass on frame one can still compound through the state.
+    err = max((a - b).abs().max().item() for a, b in zip(ref, got))
+    serr = max((a - b).abs().max().item() for a, b in zip(ref_state, got_state))
+    print(f"  {nsteps} steps, compiled + graph vs eager: max|d| = {err:.3e}")
+    print(f"  ssm state after {nsteps} steps:            max|d| = {serr:.3e}")
+    assert err < 1e-5, "compiled graph decode diverges from eager"
+    assert serr < 1e-5, "compiled graph decode leaves a different state"
+    dynamo.reset()
+
+
 @torch.inference_mode()
-def test_cuda_graph(device) -> None:
-    """CUDA graph decoding must give the same results as calling forward directly."""
-    print("\n--- CUDA graph decoding ---")
+def test_graph_decoding(device) -> None:
+    """Graph decoding must give the same results as calling forward directly."""
+    print("\n--- Graph decoding ---")
     if device.type != "cuda":
         print("  skipped (requires CUDA).")
         return
@@ -237,7 +404,7 @@ def test_cuda_graph(device) -> None:
     got = [cache.run(x) for x in frames]
     err = max((a - b).abs().max().item() for a, b in zip(ref, got))
     print(f"  {nsteps} frames, max|d| = {err:.3e}")
-    assert err < 1e-5, "CUDA graph result differs from call-by-call forward"
+    assert err < 1e-5, "graph replay differs from call-by-call forward"
 
     # After a full reset, replaying the first frame should match starting from
     # a zero state.
@@ -304,10 +471,10 @@ def benchmark(device) -> None:
 
     print()
     print("=" * 72)
-    print("Single-step decode latency: plain forward vs CUDA graph "
+    print("Single-step decode latency: plain forward vs graph replay "
           "(3 layers, batch 64, d_model=320)")
     print("=" * 72)
-    print(f"{'d_state':>9}{'forward':>14}{'CUDA graph':>14}{'speedup':>10}"
+    print(f"{'d_state':>9}{'forward':>14}{'graph replay':>14}{'speedup':>10}"
           f"{'of 60FPS':>12}")
     print("-" * 72)
 
@@ -345,8 +512,11 @@ if __name__ == "__main__":
         torch.manual_seed(0)
         test_scan(dev)
         test_mamba3(dev)
+        test_step_dedicated_path(dev)
         test_official_conventions(dev)
-        test_cuda_graph(dev)
+        test_backend_parity(dev)
+        test_graph_decoding(dev)
+        test_compiled_decode(dev)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = _tf32
 

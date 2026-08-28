@@ -1,6 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/PyTorch-only-ee4c2c?style=flat-square" alt="PyTorch only">
-  <img src="https://img.shields.io/badge/CUDA-no%20nvcc-0f7b6c?style=flat-square" alt="No nvcc">
+  <img src="https://img.shields.io/badge/build-no%20nvcc-0f7b6c?style=flat-square" alt="No nvcc">
+  <img src="https://img.shields.io/badge/backend-agnostic-4a5568?style=flat-square" alt="Backend agnostic">
   <img src="https://img.shields.io/badge/API-mamba__ssm-1e3a5f?style=flat-square" alt="Official API">
   <img src="https://img.shields.io/badge/paper-arXiv%3A2603.15569-b31b1b?style=flat-square" alt="Paper">
 </p>
@@ -10,21 +11,23 @@
 <p align="center">
   The whole of <a href="https://arxiv.org/abs/2603.15569">Mamba-3</a> in one file —
   official <a href="https://github.com/state-spaces/mamba"><code>mamba_ssm</code></a> API,
-  pure PyTorch, no kernels to build.
+  pure PyTorch, no kernels to build, no backend to pick.
 </p>
 
 <p align="center">
   <img src="assets/architecture.png" width="560" alt="The data path of one Mamba-3 layer">
 </p>
 
-Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you have Mamba-3 running on the GPU: SISO and MIMO, chunked prefill, single-step decode, CUDA-graph replay, gradients included.
+Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you have Mamba-3 on whatever device PyTorch is already using: SISO and MIMO, chunked prefill, single-step decode, graph replay that composes with `torch.compile`, gradients included.
 
-**Nothing to compile.** No nvcc, no CUDA Toolkit, no MSVC, no Triton, no TileLang, no einops, no `mamba-ssm`. A CUDA-enabled PyTorch build is the entire dependency list — which is what makes this work on Windows, inside a locked-down container, or on a cluster where you cannot install a toolchain.
+**Nothing to build.** No nvcc, no CUDA Toolkit, no MSVC, no Triton, no TileLang, no einops, no `mamba-ssm`. A PyTorch install is the entire dependency list — which is what makes this work on Windows, inside a locked-down container, or on a cluster where you cannot install a toolchain.
+
+**Any device PyTorch has.** The math is ordinary PyTorch ops and the runtime calls around graph capture go through `torch.accelerator`, so there is no vendor-specific path to fall off. The file follows PyTorch to whatever device it supports, CPU included — and CPU is not a degraded mode: given the same weights, forward, backward and decode land within ~3×10⁻⁶ of CUDA in fp32.
 
 **Not a lookalike.** This file replaces the official *kernel backend*, not the interface. Module names, arguments, attributes, state layouts and calling conventions follow `mamba_ssm` exactly, and parameter names line up one-to-one with the official modules — so upstream code and docs apply to it unchanged.
 
 <p align="center">
-  <img src="assets/headline.png" width="560" alt="72x faster scan, 0.51 ms decode, 247x smaller state, 1.1e-6 max error">
+  <img src="assets/headline.png" width="560" alt="70x faster scan, 0.075 ms compiled decode, 247x smaller state, 1.1e-6 max error">
 </p>
 
 ---
@@ -39,11 +42,13 @@ pip install torch
 import torch
 from mamba3 import Mamba3, MixerModel, InferenceParams, update_graph_cache
 
-layer = Mamba3(d_model=256, d_state=64, headdim=64).cuda()
-y = layer(torch.randn(2, 128, 256, device="cuda"))          # (B, L, D) → (B, L, D)
+device = torch.accelerator.current_accelerator()            # cuda / xpu / mps; None on CPU
+
+layer = Mamba3(d_model=256, d_state=64, headdim=64).to(device)
+y = layer(torch.randn(2, 128, 256, device=device))          # (B, L, D) → (B, L, D)
 
 model = MixerModel(256, n_layer=4, rms_norm=True,
-                   ssm_cfg=dict(d_state=64, headdim=64)).cuda().eval()
+                   ssm_cfg=dict(d_state=64, headdim=64)).to(device).eval()
 ```
 
 SISO is the default. MIMO and the Mamba-3 extras use the same argument names as upstream:
@@ -58,7 +63,7 @@ Mamba3(
 )
 ```
 
-## Prefill, decode, CUDA graph
+## Prefill, decode, graph capture
 
 `inference_params` follows the official convention: `seqlen_offset == 0` is the chunked prefill; `seqlen_offset > 0` and `seqlen == 1` is single-step decode. Segmented forwards resume from the cached state.
 
@@ -67,7 +72,7 @@ params = InferenceParams(max_seqlen=1024, max_batch_size=2)
 y = model(x, inference_params=params)       # prefill
 params.seqlen_offset += x.shape[1]
 
-token = torch.randn(2, 1, 256, device="cuda")
+token = torch.randn(2, 1, 256, device=device)
 y_t = model(token, inference_params=params) # eager decode
 params.seqlen_offset += 1
 
@@ -75,11 +80,26 @@ cache = update_graph_cache(model, None, batch_size=2, seqlen_og=0, max_seqlen=10
 y_t = cache.run(token)                      # one launch for the whole stack
 ```
 
+Graph capture is the one part that wants an accelerator: it exists to remove kernel-launch overhead, which is not a cost CPU pays. Everything above it runs anywhere.
+
+### With `torch.compile`
+
+Nothing in the file mentions `torch.compile`, and nothing needs to: compile the model, then capture it as usual.
+
+```python
+model = torch.compile(model, fullgraph=True)
+cache = update_graph_cache(model, None, batch_size=2, seqlen_og=0, max_seqlen=1024)
+```
+
+Stacking the two is worth it, because they remove different costs — replay removes the launch overhead, compilation removes the launches. Decode on the whole stack is `1` graph with `0` breaks, so `fullgraph=True` costs nothing and keeps it that way.
+
+This is the one path that reaches past PyTorch's own ops: inductor generates Triton, which a standard PyTorch wheel ships. Everything else in the file runs without it.
+
 ---
 
 ## Alignment with official
 
-Official fused kernels (Triton SISO / TileLang MIMO) are **not** compared: they need `mamba-ssm` plus nvcc / Triton / TileLang, which this file is written to avoid. What is compared is every path in this file against the one reference that does not depend on those kernels — the plain step-by-step recurrence, and a single full-sequence forward.
+Official fused kernels (Triton SISO / TileLang MIMO) are **not** compared: they need `mamba-ssm` plus nvcc / Triton / TileLang, which this file is written to avoid. What is compared is every path in this file against a reference that does not need them: the plain step-by-step recurrence, a single full-sequence forward, or — for the paths that only change how the same code runs — eager execution itself.
 
 RTX 4090, PyTorch 2.12.1+cu132, fp32, TF32 off:
 
@@ -93,8 +113,11 @@ RTX 4090, PyTorch 2.12.1+cu132, fp32, TF32 off:
 | Chunked scan, L = 32 … 4096 | Recurrence, every length | ≤ 4.8×10⁻⁶ |
 | Segmented `inference_params` | One full forward | ≤ 6.0×10⁻⁷ |
 | Official `step()` path | One full forward | ≤ 1.1×10⁻⁶ |
+| Dedicated `_mamba3_step` | General scan at L = 1 | **bit-identical** |
 | 1024 consecutive `step()` calls | One full forward | ≤ 2.9×10⁻⁶ |
-| CUDA graph, then after reset | Eager decode | 3.6×10⁻⁷ / 1.2×10⁻⁷ |
+| Graph replay, then after reset | Eager decode | 3.6×10⁻⁷ / 1.2×10⁻⁷ |
+| Compiled + replayed, 32 steps | Eager decode, output and SSM state | ≤ 9.6×10⁻⁷ |
+| CPU, same weights | CUDA forward / backward / decode | ≤ 3.4×10⁻⁶ |
 | State shapes, B/C bias, `in_proj`, RoPE, `Block`, `rms_norm_ref` | `mamba_ssm` conventions | match |
 
 </div>
@@ -130,6 +153,8 @@ Everything else follows the official code line by line. Not implemented: `cu_seq
 
 Same machine as above. Every number and figure comes from `python bench_figures.py`.
 
+Each timing is the median of five timed blocks after warmup. Most calls here are launch bound and land near a millisecond, where a single block moves by more than 20% from GPU clock drift alone — enough to read as a regression that is not in the code. What survives the median is drift on a scale of tens of seconds, so treat the last digit of a ~1 ms reading as ±10% and compare orders of magnitude, not third digits.
+
 ### Chunked scan vs the recurrence
 
 Recurrent time grows linearly with `L`; chunked time stays near 1 ms, because the inner work is cuBLAS GEMMs.
@@ -142,10 +167,10 @@ Recurrent time grows linearly with `L`; chunked time stays near 1 ms, because th
 
 | | L=32 | L=128 | L=512 |
 |---|---:|---:|---:|
-| SISO chunked | 0.71 ms | 0.76 ms | 0.86 ms |
-| SISO vs recurrence | 5.4× | 20.2× | **71.9×** |
-| MIMO(R=2) chunked | 0.77 ms | 0.88 ms | 1.07 ms |
-| MIMO(R=2) vs recurrence | 6.3× | 21.5× | **69.2×** |
+| SISO chunked | 0.67 ms | 0.73 ms | 0.87 ms |
+| SISO vs recurrence | 5.9× | 21.2× | **70.1×** |
+| MIMO(R=2) chunked | 0.73 ms | 0.83 ms | 1.07 ms |
+| MIMO(R=2) vs recurrence | 6.4× | 22.4× | **68.3×** |
 
 </div>
 
@@ -161,10 +186,10 @@ Backprop through `L` Python steps is the wall a readable reference implementatio
 
 | Sequence length | 128 | 1k | 4k |
 |---|---:|---:|---:|
-| Recurrence, fwd + bwd | 79 ms | 652 ms | 2615 ms |
-| Chunked scan, fwd + bwd | 2.9 ms | 4.9 ms | **12.9 ms** |
-| Recurrence, peak allocated | 273 MiB | 998 MiB | 3460 MiB |
-| Chunked scan, peak allocated | 192 MiB | 356 MiB | **916 MiB** |
+| Recurrence, fwd + bwd | 76 ms | 640 ms | 2568 ms |
+| Chunked scan, fwd + bwd | 2.7 ms | 5.1 ms | **12.8 ms** |
+| Recurrence, peak allocated | 218 MiB | 942 MiB | 3404 MiB |
+| Chunked scan, peak allocated | 137 MiB | 300 MiB | **861 MiB** |
 
 </div>
 
@@ -180,32 +205,42 @@ The reason to reach for an SSM. Decoding one token costs the same whether 256 or
 
 | Context | 256 | 1k | 4k | 16k |
 |---|---:|---:|---:|---:|
-| Attention + KV cache | 0.08 ms | 0.21 ms | 0.78 ms | 3.09 ms |
-| Mamba-3 recurrent state | 1.03 ms | 1.06 ms | 0.99 ms | **0.98 ms** |
+| Attention + KV cache | 0.07 ms | 0.20 ms | 0.76 ms | 3.07 ms |
+| Mamba-3 recurrent state | 0.96 ms | 0.85 ms | 0.95 ms | **0.92 ms** |
 | KV cache, per layer | 3.0 MiB | 12.0 MiB | 48.0 MiB | 192.0 MiB |
 | SSM state, per layer | 0.78 MiB | 0.78 MiB | 0.78 MiB | **0.78 MiB** |
 
 </div>
 
-Latency crosses over near 5k tokens; memory is flat throughout, 247× smaller at 16k. Two caveats worth stating plainly: that flat line is the *eager* path, so a CUDA graph moves it further down, and for batched **prefill** the fused attention kernels stay ahead of a pure-PyTorch scan. The structural win is in streaming decode.
+Latency crosses over between 4k and 8k tokens; memory is flat throughout, 247× smaller at 16k. Two caveats worth stating plainly: that flat line is the *eager* path, so a captured graph moves it further down, and for batched **prefill** the fused attention kernels stay ahead of a pure-PyTorch scan. The structural win is in streaming decode.
 
-### Eager vs CUDA-graph decode
+### Eager vs graph decode
 
-Decoding one token at a time, 3 layers, batch 64, `d_model=320`. At this size a step is almost pure kernel-launch overhead, which a graph replay removes.
+Decoding one token at a time, 3 layers, batch 64, `d_model=320`. After the dedicated single-step path, a step is still mostly kernel-launch overhead, which a graph replay removes.
 
 <p align="center">
-  <img src="assets/decode.png" width="600" alt="Eager vs CUDA-graph decode">
+  <img src="assets/decode.png" width="600" alt="Eager vs graph decode">
 </p>
 
 <div align="center">
 
-| `d_state` | Eager | CUDA graph | Speedup | of 60 FPS |
+| `d_state` | Eager | Graph replay | Speedup | of 60 FPS |
 |---:|---:|---:|---:|---:|
-| 16 | 3.52 ms | **0.51 ms** | 6.9× | 3.1% |
-| 32 | 3.54 ms | **0.55 ms** | 6.5× | 3.3% |
-| 64 | 3.66 ms | **0.75 ms** | 4.9× | 4.5% |
+| 16 | 3.13 ms | **0.47 ms** | 6.6× | 2.8% |
+| 32 | 3.22 ms | **0.52 ms** | 6.2× | 3.1% |
+| 64 | 3.21 ms | **0.74 ms** | 4.3× | 4.4% |
 
 </div>
+
+### Adding `torch.compile`
+
+Replay and compilation remove different costs, so the two stack: replay removes the launch overhead, compilation removes the launches. Same stack as above at `d_state=32`, decoding one token.
+
+<p align="center">
+  <img src="assets/compile.png" width="600" alt="Compilation and replay compose: 41x at batch 1, 27x at batch 64">
+</p>
+
+Either one alone lands near 0.5 ms — compilation wins at batch 64, replay wins at batch 1 — and together they are another 4–5× below that. `mode="reduce-overhead"` measures the same as the default within noise, for the reason in [Implementation notes](#implementation-notes).
 
 ### Training throughput
 
@@ -221,6 +256,7 @@ Autograd runs straight through the chunked scan — no custom backward, no recom
 python test_mamba3.py      # numerical self-checks + benchmarks
 python bench_figures.py    # re-measure and redraw every figure above
 python arch_figure.py      # redraw the diagram at the top
+python stats_figure.py     # redraw the headline numbers
 ```
 
 `bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU.
@@ -261,7 +297,15 @@ cs_t = Σ_{k≤t} A_k · dt_k
 
 Split into chunks of length `Q`: every `(i, j)` pair inside a chunk is one matmul, and only `L/Q` states move serially. Training uses this path; decoding uses the step-by-step recurrence.
 
-**CUDA graph decoding.** Single-step decode is almost pure kernel-launch overhead. `capture_graph` records the whole call chain into one graph. States update in place with `copy_`, so a replay reads and writes the addresses fixed at capture time.
+**Dedicated single-step path.** `step()` does not route through the general length-axis scan. `_mamba3_step` drops the axis rather than degenerating it to one — no single-element `cumsum`, no stack of a singleton, no packing/unpacking through `unsqueeze(1)`. The arithmetic order stays the same, so results are bit-identical to `_mamba3_combined` at `L = 1` (asserted with `torch.equal` in `test_mamba3.py`). On the eager path this cuts ~100 aten calls per token; graph replay still removes the remaining launch overhead.
+
+**Graph decoding.** Single-step decode remains largely kernel-launch overhead. `capture_graph` records the whole call chain into one graph. States update in place with `copy_`, so a replay reads and writes the addresses fixed at capture time.
+
+Everything around the capture — streams, synchronization, cache trimming, memory pools — goes through the device-agnostic `torch.accelerator` API, so nothing here is CUDA-only by construction. The one exception is the graph object itself: `torch.accelerator.Graph` is the neutral interface, but as of PyTorch 2.13 only XPU registers an implementation and constructing one on CUDA raises, so `_new_graph` falls back to `torch.cuda.CUDAGraph`. That fallback is the single named backend in the file; when CUDA registers its implementation ([pytorch#171313](https://github.com/pytorch/pytorch/pull/171313)) the neutral path is taken with no other change.
+
+One consequence of dropping `torch.cuda.graph` is worth naming: it captured on a class-level stream shared by every graph, which is what let graphs sharing a mempool actually reuse memory. Capturing each on its own stream doubles reserved memory across a multi-graph cache. `DecodingCGCache` therefore holds the capture stream next to the pool and passes both to every capture.
+
+**Composing with `torch.compile`.** Compilation and replay remove different costs, so they stack, and the file needs no code for either. One subtlety is worth recording because the usual advice points the other way: `mode="reduce-overhead"` is normally the decode mode, since it adds CUDA graphs of its own — which under an explicit capture would be the classic double-graphing. That cannot happen here. The in-place `copy_` state updates count as mutated inputs, so inductor logs `skipping cudagraphs due to mutated inputs` and turns them off by itself. With its one distinguishing feature disabled, `reduce-overhead` measures the same as `default` either way, so plain `torch.compile(model)` is what belongs under a capture.
 
 **No einops.** On this path Python itself is hot; `rearrange` pattern parsing measured +10.8% on eager single-step. The file uses `reshape` / `permute` / `einsum`.
 

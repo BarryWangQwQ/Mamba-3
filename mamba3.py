@@ -1,12 +1,13 @@
-"""Single-file Mamba-3. Official ``mamba_ssm`` API, PyTorch as the only dependency.
+"""Single-file Mamba-3, with PyTorch as its only dependency.
 
 Paper: https://arxiv.org/abs/2603.15569
 Official: https://github.com/state-spaces/mamba
 
-No nvcc, CUDA Toolkit, Triton, TileLang, einops or mamba-ssm. A CUDA-enabled
-PyTorch build is enough for GPU acceleration. Names, arguments, state layouts
-and calling conventions match the official package, so weights and docs carry
-over. See README.md for the API map, deviations, and implementation notes.
+Names, arguments, state layouts and calling conventions follow the official
+mamba_ssm package, so weights and documentation carry over. There is nothing
+to build and no backend to select: the compute is ordinary PyTorch ops, so it
+runs wherever PyTorch does. README.md covers the API map, the deviations from
+upstream, and the implementation notes.
 
 Self-check and benchmark: python test_mamba3.py
 """
@@ -428,6 +429,130 @@ def _mamba3_combined(
         Y = Y.squeeze(2)
 
     return Y, nxt_angle_state, nxt_ssm_state, nxt_k_state, nxt_v_state
+
+
+def _outer_kv(V_rank, K, rank):
+    """Σ_r V[r] ⊗ K[r] → (B, H, P, N)."""
+    if rank == 1:
+        # A sum over a single term, so the outer product alone gives the same
+        # numbers without the reshape and permute traffic einsum emits.
+        return V_rank.squeeze(1).unsqueeze(-1) * K.squeeze(1).unsqueeze(-2)
+    return torch.einsum("brhp,brhn->bhpn", V_rank, K)
+
+
+def _mamba3_step(
+    Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z,
+    rotate_pairwise, Input_States, MIMO_V, MIMO_Z, MIMO_Out,
+    outproj_norm_weight, outproj_norm_eps,
+):
+    """Single-token specialization of _mamba3_combined, for decoding.
+
+    _mamba3_combined is written for (B, L, ...) and stays correct at L = 1, but a
+    decode step is dispatch bound, not compute bound: going through the general
+    path costs ~350 aten calls for ~90 kernels, and most of the remainder is
+    metadata churn on a length axis of one — a cumsum over a single element, a
+    stack of a single tensor, and a long tail of unsqueeze/select/slice. This
+    version drops the axis rather than degenerating it.
+
+    Arguments are exactly what Mamba3._preprocess returns, with no length axis:
+
+        Q, K:    (B, R, H, N)    V: (B, H, P)    ADT, DT, Trap: (B, H)
+        Angles:  (B, H, S)       Q_bias, K_bias: (H, R, N)    D: (H,)
+        Z:       (B, H, P) or None
+
+    Returns (Y, angle_state, ssm_state, k_state, v_state), the L = 1 outputs of
+    _mamba3_combined with the length axis squeezed out. Operations are kept in
+    the same order and dtype, so results are bit-identical; test_mamba3.py
+    asserts that with torch.equal.
+    """
+    batch, rank = Q.shape[0], Q.shape[1]
+    nheads, headdim = V.shape[1], V.shape[2]
+    d_state = K.shape[-1]
+
+    ADT = ADT.float()
+    DT = DT.float()
+    trap = torch.sigmoid(Trap.float())
+    half = 0.5 * trap
+    alpha = DT * (1.0 - half)
+    beta = DT * half
+
+    angle_state, ssm_state, k_state, v_state = (
+        Input_States if Input_States is not None else (None, None, None, None)
+    )
+
+    Q = Q.float() + Q_bias.permute(1, 0, 2)
+    K = K.float() + K_bias.permute(1, 0, 2)
+
+    # Over one token the running sum of dt-scaled angles is just this token's.
+    angles = Angles.float() * DT.unsqueeze(-1)
+    if angle_state is not None:
+        angles = angles + angle_state
+    nxt_angle_state = angles
+
+    rot = 2 * Angles.shape[-1]
+    cos, sin = torch.cos(angles).unsqueeze(1), torch.sin(angles).unsqueeze(1)
+    if rot == d_state:
+        # Nothing is left unrotated, so the concatenation would copy for nothing.
+        Q = _apply_rotary(Q, cos, sin, rotate_pairwise)
+        K = _apply_rotary(K, cos, sin, rotate_pairwise)
+    else:
+        Q = torch.cat(
+            [_apply_rotary(Q[..., :rot], cos, sin, rotate_pairwise), Q[..., rot:]],
+            dim=-1,
+        )
+        K = torch.cat(
+            [_apply_rotary(K[..., :rot], cos, sin, rotate_pairwise), K[..., rot:]],
+            dim=-1,
+        )
+    nxt_k_state = K
+    nxt_v_state = V
+
+    V = V.float()
+    mimo_v = MIMO_V.permute(1, 0, 2).float() if MIMO_V is not None else None
+    V_rank = V.unsqueeze(1) if mimo_v is None else V.unsqueeze(1) * mimo_v
+
+    if ssm_state is None:
+        ssm_state = V.new_zeros(batch, nheads, headdim, d_state)
+    else:
+        ssm_state = ssm_state.float()
+
+    if v_state is None or k_state is None:
+        kv_prev = V.new_zeros(batch, nheads, headdim, d_state)
+    else:
+        v_state = v_state.float()
+        v_state_rank = (
+            v_state.unsqueeze(1) if mimo_v is None else v_state.unsqueeze(1) * mimo_v
+        )
+        kv_prev = _outer_kv(v_state_rank, k_state.float(), rank)
+
+    kv = _outer_kv(V_rank, K, rank)
+    ssm_state = (
+        torch.exp(ADT)[:, :, None, None] * ssm_state
+        + alpha[:, :, None, None] * kv
+        + beta[:, :, None, None] * kv_prev
+    )
+    Y = torch.einsum("brhn,bhpn->brhp", Q, ssm_state)
+
+    Y = Y + D.float().view(1, 1, -1, 1) * V.unsqueeze(1)
+
+    if Z is not None:
+        Z = Z.float().unsqueeze(1)
+        if MIMO_Z is not None:
+            Z = Z * MIMO_Z.permute(1, 0, 2).float()
+        if outproj_norm_weight is not None:
+            Y = rms_norm_ref(
+                Y.flatten(-2), outproj_norm_weight, None, z=Z.flatten(-2),
+                eps=outproj_norm_eps, group_size=headdim, norm_before_gate=True,
+            ).unflatten(-1, (nheads, headdim))
+        else:
+            Y = Y * F.silu(Z)
+
+    if MIMO_Out is not None:
+        Y = (Y * MIMO_Out.permute(1, 0, 2).float()).sum(dim=1)
+    elif rank == 1:
+        Y = Y.squeeze(1)
+
+    return Y, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
 
 
 def mamba3_siso_combined(
@@ -860,67 +985,64 @@ class Mamba3(nn.Module):
             dd_A, dd_dt, B, C, x, z, trap, angles
         )
 
-        # Reuse the seqlen=1 branch of the combined scan: it takes the
-        # step-by-step recurrence internally and matches the batched forward
-        # numerically. Bias and rotation are applied inside the scan, so what is
-        # passed here is the raw output of _preprocess.
+        # _mamba3_step is the length-one specialization of the scan used by
+        # forward, bit-identical to it and taking _preprocess's output shapes
+        # directly. Bias and rotation are applied inside.
         common = dict(
-            V=x.unsqueeze(1),
-            ADT=(A * DT).unsqueeze(-1),
-            DT=DT.unsqueeze(-1),
-            Trap=torch.logit(trap).unsqueeze(-1),
-            Angles=angles.unsqueeze(1),
+            V=x,
+            ADT=A * DT,
+            DT=DT,
+            Trap=torch.logit(trap),
+            Angles=angles,
             D=self.D,
+            Q_bias=self.C_bias,
+            K_bias=self.B_bias,
             Input_States=(angle_state, ssm_state, k_state, v_state),
         )
 
         if self.is_mimo:
-            y, nxt_angle_state, state_out, nxt_k_state, nxt_v_state = mamba3_mimo_combined(
-                Q=C.unsqueeze(1),
-                K=B.unsqueeze(1),
-                Q_bias=self.C_bias,
-                K_bias=self.B_bias,
+            gated_in_scan = self.fuse_pregate_headwise_norm or not self.is_outproj_norm
+            y, nxt_angle_state, state_out, nxt_k_state, nxt_v_state = _mamba3_step(
+                Q=C,
+                K=B,
+                Z=z if gated_in_scan else None,
+                rotate_pairwise=False,
                 MIMO_V=self.mimo_x,
                 MIMO_Z=self.mimo_z,
-                MIMO_Out=self.mimo_o
-                if (self.fuse_pregate_headwise_norm or not self.is_outproj_norm) else None,
-                Z=z.unsqueeze(1)
-                if (self.fuse_pregate_headwise_norm or not self.is_outproj_norm) else None,
-                chunk_size=self.chunk_size,
-                rotary_dim_divisor=self.rotary_dim_divisor,
-                return_state=True,
-                fuse_pregate_headwise_rms_norm=self.fuse_pregate_headwise_norm,
-                outproj_norm_weight=self.norm.weight if self.fuse_pregate_headwise_norm else None,
-                outproj_norm_eps=self.norm.eps if self.fuse_pregate_headwise_norm else 1e-5,
+                MIMO_Out=self.mimo_o if gated_in_scan else None,
+                outproj_norm_weight=(
+                    self.norm.weight if self.fuse_pregate_headwise_norm else None
+                ),
+                outproj_norm_eps=(
+                    self.norm.eps if self.fuse_pregate_headwise_norm else 1e-5
+                ),
                 **common,
             )
             if self.is_outproj_norm and not self.fuse_pregate_headwise_norm:
                 y = self._postprocess(
-                    y.squeeze(1),
+                    y,
                     self.mimo_o.permute(1, 0, 2),
                     z,
                     self.mimo_z.permute(1, 0, 2),
                     self.headdim,
                 )
-            else:
-                y = y.squeeze(1)
         else:
-            y, nxt_angle_state, state_out, nxt_k_state, nxt_v_state = mamba3_siso_combined(
-                Q=C.squeeze(1).unsqueeze(1),
-                K=B.squeeze(1).unsqueeze(1),
-                Q_bias=self.C_bias.squeeze(1),
-                K_bias=self.B_bias.squeeze(1),
-                Z=z.unsqueeze(1) if not self.is_outproj_norm else None,
-                chunk_size=self.chunk_size,
-                return_final_states=True,
+            y, nxt_angle_state, state_out, nxt_k_state, nxt_v_state = _mamba3_step(
+                Q=C,
+                K=B,
+                Z=z if not self.is_outproj_norm else None,
+                rotate_pairwise=True,
+                MIMO_V=None,
+                MIMO_Z=None,
+                MIMO_Out=None,
+                outproj_norm_weight=None,
+                outproj_norm_eps=1e-5,
                 **common,
             )
-            y = y.squeeze(1)
             if self.is_outproj_norm:
                 y = self.norm(y.flatten(-2), z.flatten(-2)).unflatten(
                     -1, (self.nheads, self.headdim)
                 )
-            nxt_k_state = nxt_k_state.unsqueeze(1)
 
         # out_proj
         out = self.out_proj(y.flatten(-2).to(x.dtype))
@@ -1291,7 +1413,7 @@ def initialize_states(inference_params: InferenceParams, batch_mask: Optional[Te
                 zeroes the whole batch. Per-sample zeroing is useful at clip
                 boundaries and for state dropout.
 
-    Writes are always in place, so an already captured CUDA graph stays valid.
+    Writes are always in place, so an already captured graph stays valid.
     seqlen_offset is reset as well, sending the next forward back down the
     prefill path.
     """
@@ -1306,8 +1428,32 @@ def initialize_states(inference_params: InferenceParams, batch_mask: Optional[Te
 
 
 # =============================================================================
-# 6. CUDA graph decoding
+# 6. Accelerator graph decoding
 # =============================================================================
+
+
+def _new_graph(pool=None):
+    """Create an accelerator graph, preferring the device-agnostic API.
+
+    torch.accelerator.Graph is the backend-neutral interface. As of PyTorch 2.13
+    only XPU registers an implementation, so constructing one on CUDA raises
+    "Graph is not supported on device type: cuda"; torch.cuda.CUDAGraph covers
+    that case with the same capture_begin / capture_end / replay / pool surface.
+    Once CUDA registers its implementation (pytorch#171313) the neutral path is
+    taken here with no other change.
+
+    Returns (graph, begin), because the two spell the capture options
+    differently: the neutral API takes them at construction, CUDA at
+    capture_begin.
+    """
+    try:
+        graph = torch.accelerator.Graph(pool=pool)
+        return graph, graph.capture_begin
+    except (AttributeError, RuntimeError):
+        graph = torch.cuda.CUDAGraph()
+        return graph, partial(
+            graph.capture_begin, pool=pool, capture_error_mode="global"
+        )
 
 
 @dataclass
@@ -1320,6 +1466,11 @@ class DecodingCGCache:
     dtype = None
     callables: dict = field(default_factory=dict)
     mempool = None
+    # Captures sharing a pool must also share the stream they were captured on,
+    # or the pool cannot reuse memory across them. torch.cuda.graph hid this by
+    # using one class-level capture stream; with the neutral API the stream is
+    # ours to keep.
+    stream = None
     inference_params: Optional[InferenceParams] = None
     run: Optional[Callable] = None
 
@@ -1333,19 +1484,28 @@ def _infer_d_model(model) -> int:
 
 def capture_graph(
     model, inference_params, batch_size, max_seqlen, decoding_seqlen=1,
-    mempool=None, n_warmups=2, d_model=None, dtype=None,
+    mempool=None, n_warmups=2, d_model=None, dtype=None, stream=None,
 ):
-    """Record single-step decoding into a CUDA graph, matching the official
-    generation.capture_graph.
+    """Record single-step decoding into an accelerator graph, matching the
+    official generation.capture_graph.
 
-    CUDA graphs appear exactly once in the official repo, and that one place is
-    tied entirely to language models: the static buffers are input_ids /
+    Graph capture appears exactly once in the official repo, and that one place
+    is tied entirely to language models: the static buffers are input_ids /
     position_ids, forward is read for .logits, and the only public entry point is
     GenerationMixin.generate(cg=True). There is no non-LM version to follow, so
     the static buffer here becomes hidden_states of shape
     (batch, decoding_seqlen, d_model), and d_model / dtype are accepted as extra
     arguments (token ids carry no feature dimension, so upstream never needs
-    them). Everything else follows the official code line by line.
+    them). Everything else follows the official code line by line, except that
+    the runtime calls are the device-agnostic torch.accelerator ones rather than
+    torch.cuda; see _new_graph for the one place a backend is still named.
+
+    stream is the other addition, and it exists because of that same move.
+    Captures that share a mempool only reuse memory if they also share the
+    stream they were captured on, which torch.cuda.graph got for free from a
+    class-level capture stream. Passing the same stream alongside the same
+    mempool restores that; leaving it None captures on a fresh stream, which is
+    what a lone graph wants anyway.
 
     States are updated in place with copy_ inside forward, per the official
     convention, so a replay reads and writes the very addresses fixed at capture
@@ -1372,21 +1532,28 @@ def capture_graph(
         inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
 
     # Warmup before capture
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
+    stream = torch.Stream(device=device) if stream is None else stream
+    stream.wait_stream(torch.accelerator.current_stream(device))
+    with stream:
         for _ in range(n_warmups):
             out = model(hidden_states, inference_params=inference_params)
-        s.synchronize()
+        stream.synchronize()
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-    torch.cuda.current_stream().wait_stream(s)
+    torch.accelerator.current_stream(device).wait_stream(stream)
 
-    # Captures the graph
-    # To allow capture, automatically sets a side stream as the current stream in the context
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, pool=mempool):
+    # Captures the graph. Free what we can first, as both backends' own capture
+    # context managers do. The side stream is explicit because the neutral API
+    # records whatever stream is current, and a graph cannot be captured on the
+    # default one.
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    torch.accelerator.empty_host_cache()
+    graph, begin = _new_graph(mempool)
+    with stream:
+        begin()
         out = model(hidden_states, inference_params=inference_params)
+        graph.capture_end()
 
     def run(new_hidden_states, seqlen=None):
         if seqlen is not None and inference_params.lengths_per_sample is not None:
@@ -1397,6 +1564,11 @@ def capture_graph(
         # back a copy.
         return out.clone()
 
+    # Exposed so update_graph_cache can share this graph's memory pool with the
+    # next capture: the neutral API has no standalone pool handle to allocate up
+    # front, only Graph.pool() once a graph exists.
+    run.graph = graph
+
     inference_params.seqlen_offset = seqlen_offset_og
     return run
 
@@ -1406,7 +1578,7 @@ def update_graph_cache(
     model, cache, batch_size, seqlen_og, max_seqlen,
     decoding_seqlens=(1,), dtype=None, n_warmups=2,
 ):
-    """Build or reuse the CUDA graph cache, matching the official
+    """Build or reuse the accelerator graph cache, matching the official
     generation.update_graph_cache.
 
     Capture warms up on zero inputs, which dirties the states; they are zeroed
@@ -1445,12 +1617,13 @@ def update_graph_cache(
     ):  # Invalidate the cache
         cache.callables = {}
         cache.mempool = None
+        cache.stream = None
         cache.inference_params = None
         gc.collect()
         cache.device, cache.dtype = device, dtype
         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
         assert hasattr(model, "allocate_inference_cache"), (
-            "CUDA graph decoding requires that the model has a method allocate_inference_cache"
+            "Graph decoding requires that the model has a method allocate_inference_cache"
         )
         inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
         lengths_per_sample = torch.full(
@@ -1463,10 +1636,11 @@ def update_graph_cache(
             key_value_memory_dict=inf_cache,
             lengths_per_sample=lengths_per_sample,
         )
-        cache.mempool = torch.cuda.graphs.graph_pool_handle()
+    if cache.stream is None:
+        cache.stream = torch.Stream(device=device)
     for decoding_seqlen in decoding_seqlens:
         if (batch_size, decoding_seqlen) not in cache.callables:
-            cache.callables[batch_size, decoding_seqlen] = capture_graph(
+            run = capture_graph(
                 model,
                 cache.inference_params,
                 batch_size,
@@ -1474,7 +1648,14 @@ def update_graph_cache(
                 decoding_seqlen=decoding_seqlen,
                 mempool=cache.mempool,
                 n_warmups=n_warmups,
+                stream=cache.stream,
             )
+            cache.callables[batch_size, decoding_seqlen] = run
+            # The first graph opens the pool the rest capture into. Held on the
+            # cache together with the stream, since sharing one without the
+            # other defeats the reuse; see capture_graph.
+            if cache.mempool is None:
+                cache.mempool = run.graph.pool()
 
     def dispatch(hidden_states, seqlen=None):
         batch_size, decoding_seqlen = hidden_states.shape[:2]

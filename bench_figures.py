@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import time
 from pathlib import Path
 
@@ -114,7 +115,7 @@ def _heading(fig, title: str, *subtitle: str, axes_title: bool = True) -> None:
     h = fig.get_figheight()
     fig.subplots_adjust(top=1.0 - (0.30 + 0.32 * axes_title + 0.21 * len(subtitle)) / h)
     y = 1.0 - 0.04 / h
-    fig.text(0.0, y, title, fontsize=15.0, fontweight="semibold", color=INK, va="top")
+    fig.text(0.0, y, title, fontsize=15.0, fontweight="bold", color=INK, va="top")
     for i, line in enumerate(subtitle):
         y -= (0.30 if i == 0 else 0.21) / h
         fig.text(0.0, y, line, fontsize=11.0, color=MUTED, va="top")
@@ -137,15 +138,38 @@ def _save(fig, name: str) -> None:
 # --------------------------------------------------------------------------
 # Timing helpers
 # --------------------------------------------------------------------------
-def timeit(fn, iters=20, warmup=5) -> float:
+def timeit(fn, iters=20, warmup=5, reps=5, budget_s=2.0) -> float:
+    """Median of `reps` timed blocks of `iters` calls, in ms per call.
+
+    One block is not enough at these sizes. Most calls here are launch bound and
+    land near a millisecond, where GPU clock drift alone moves a single block by
+    more than 20% — enough to invent a regression that is not in the code. The
+    median across blocks is what makes a number reproducible run to run.
+
+    `budget_s` caps the extra cost: a callable slow enough to have averaged out
+    on its own stops after three blocks instead of being re-timed for minutes.
+
+    This does not make sub-millisecond numbers exact. What is left after the
+    median is drift on a scale of tens of seconds, which more blocks do not
+    remove because neighbouring blocks are correlated; expect the last digit of
+    a ~1 ms reading to move by about 10% between runs.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - start) / iters * 1000.0
+
+    times, spent = [], 0.0
+    for _ in range(reps):
+        start = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+        block = time.perf_counter() - start
+        spent += block
+        times.append(block / iters * 1000.0)
+        if spent > budget_s and len(times) >= 3:
+            break
+    return statistics.median(times)
 
 
 def peak_mem_mb(fn) -> float:
@@ -278,7 +302,7 @@ def measure(device) -> dict:
         layer_alignment.append({"tag": tag, "segmented": e_seg, "stepwise": e_step})
         print(f"   {tag:<24s} seg={e_seg:.2e} step={e_step:.2e}")
 
-    print("-- cuda graph")
+    print("-- graph replay")
     model = MixerModel(128, n_layer=3, rms_norm=True,
                        ssm_cfg=dict(d_state=32, headdim=32)).to(device).eval().float()
     frames = [torch.randn(6, 1, 128, device=device) for _ in range(10)]
@@ -432,6 +456,52 @@ def measure(device) -> dict:
               f"{t_eager / t_graph:.1f}x")
     decode_bench_params = {"batch": dec_bs, "n_layer": 3, "d_model": 320, "headdim": 64}
 
+    print("-- compile bench")
+    # The four configurations of the decode path, since compilation and replay
+    # are independent: replay removes launch overhead, compilation removes the
+    # launches. reduce-overhead is measured too because it brings its own CUDA
+    # graphs, which would be a second layer under our capture -- except that the
+    # in-place state updates make inductor skip them, so it buys nothing here.
+    compile_bench = []
+    import torch._dynamo as dynamo
+    for batch in (1, 64):
+        row = {"batch": batch}
+        for tag, mode, graph in (("eager", None, False),
+                                 ("compile", "default", False),
+                                 ("compile_ro", "reduce-overhead", False),
+                                 ("graph", None, True),
+                                 ("compile_graph", "default", True),
+                                 ("compile_ro_graph", "reduce-overhead", True)):
+            dynamo.reset()
+            torch.accelerator.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            m = MixerModel(320, n_layer=3, rms_norm=True,
+                           ssm_cfg=dict(d_state=32, headdim=64)).to(device).eval().float()
+            x = torch.randn(batch, 1, 320, device=device)
+            try:
+                with torch.inference_mode():
+                    fn = m if mode is None else torch.compile(m, mode=mode, fullgraph=True)
+                    p = InferenceParams(max_seqlen=dec_len, max_batch_size=batch)
+                    p.key_value_memory_dict = m.allocate_inference_cache(batch, dec_len)
+                    p.seqlen_offset = 1
+                    for _ in range(5):
+                        fn(x, inference_params=p)
+                    if graph:
+                        cache = update_graph_cache(fn, None, batch, 0, dec_len)
+                        call = lambda: cache.run(x)
+                    else:
+                        call = lambda: fn(x, inference_params=p)
+                    row[tag] = timeit(call, iters=100, warmup=30)
+                row[tag + "_mib"] = torch.cuda.max_memory_allocated() / 2**20
+            except Exception as exc:
+                row[tag] = row[tag + "_mib"] = None
+                print(f"   B={batch} {tag} failed: {type(exc).__name__}")
+        compile_bench.append(row)
+        print(f"   B={batch} " + "  ".join(
+            f"{k}={row[k]:.3f}/{row[k + '_mib']:.0f}MiB"
+            for k in row if not k.endswith("_mib") and k != "batch" and row[k] is not None))
+    dynamo.reset()
+
     print("-- trainable length: chunked scan vs the naive recurrence")
     # The recurrence is what a readable reference implementation does. Backprop through
     # L Python steps is what makes long-sequence training impractical, in time and in
@@ -475,8 +545,9 @@ def measure(device) -> dict:
         "chunk_sweep": chunk_sweep,
         "chunk_speed": chunk_speed,
         "layer_alignment": layer_alignment,
-        "cuda_graph_max_abs_diff": cg_err,
-        "cuda_graph_reset_max_abs_diff": cg_reset,
+        "graph_replay_max_abs_diff": cg_err,
+        "graph_replay_reset_max_abs_diff": cg_reset,
+        "compile_bench": compile_bench,
         "scan_bench": scan_bench,
         "train_bench": train_bench,
         "decode_scaling": decode_scaling,
@@ -532,7 +603,7 @@ def plot_scan(D) -> None:
     lo, hi = round(min(tail)), round(max(tail))
     ax_s.annotate(f"{lo}×" if lo == hi else f"{lo}–{hi}×",
                   (seqlens[-1], max(tail)), textcoords="offset points", xytext=(-8, 10),
-                  ha="right", color=INK, fontsize=12, fontweight="semibold")
+                  ha="right", color=INK, fontsize=12, fontweight="bold")
 
     _heading(fig, "Chunked GEMM vs step-by-step recurrence",
              "Recurrent cost grows linearly with L; the chunked path stays near 1 ms")
@@ -559,7 +630,7 @@ def plot_decode_scaling(D) -> None:
     last = rows[-1]
     ax_m.annotate(f"{last['attn_cache_mb'] / last['mamba_state_mb']:.0f}× smaller at 16k",
                   (xs[-1], last["mamba_state_mb"]), textcoords="offset points", xytext=(-8, 14),
-                  ha="right", color=TEAL, fontsize=11.5, fontweight="semibold")
+                  ha="right", color=TEAL, fontsize=11.5, fontweight="bold")
 
     for ax in (ax_t, ax_m):
         _style(ax, log=True)
@@ -579,7 +650,7 @@ def plot_decode_scaling(D) -> None:
              "Decode cost and memory do not depend on how much context came before")
     _footer(fig, f"{D['gpu']}  ·  fp32, one layer, B={meta['batch']}, "
                  f"d_model={meta['d_model']}, {meta['nheads']} heads",
-            "Baseline: PyTorch SDPA over a preallocated cache. Eager path — CUDA graph is faster.")
+            "Baseline: PyTorch SDPA over a preallocated cache. Eager path — graph replay is faster.")
     _save(fig, "decode_scaling.png")
 
 
@@ -600,7 +671,7 @@ def plot_chunk(D) -> None:
                   marker="s", ms=6.0, label=f"R={rank}")
         best = min(sel, key=lambda r: r["ms"])
         ax_t.text(0.35, 0.92 - 0.11 * i, f"R={rank} fastest at Q={best['chunk_size']}",
-                  transform=ax_t.transAxes, color=color, fontsize=11.5, fontweight="semibold")
+                  transform=ax_t.transAxes, color=color, fontsize=11.5, fontweight="bold")
 
     for ax in (ax_e, ax_t):
         _style(ax, log=True)
@@ -701,10 +772,10 @@ def plot_alignment(D) -> None:
     ax_s.set_title("Chunked scan — forward and backward", loc="left")
     ax_s.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
-    cg = D["cuda_graph_max_abs_diff"]
+    cg = D["graph_replay_max_abs_diff"]
     _heading(fig, "Numerical agreement",
              f"Every alternative path reproduces the reference to ~10⁻⁶ or better.",
-             f"CUDA-graph decode vs eager: {cg:.1e}")
+             f"Graph replay vs eager decode: {cg:.1e}")
     _footer(fig, f"{D['gpu']}  ·  fp32, TF32 disabled  ·  B=3, L=40",
             "Top: d_model=128, N=32.  Bottom: H=4, P=16, N=32, chunk=8")
     _save(fig, "alignment.png")
@@ -718,15 +789,15 @@ def plot_decode(D) -> None:
     eager = [r["eager_ms"] for r in rows]
     graph = [r["graph_ms"] for r in rows]
     b1 = ax.bar(x - w / 2, eager, w, color=SLATE, label="Eager step", zorder=2)
-    b2 = ax.bar(x + w / 2, graph, w, color=BLUE, label="CUDA graph", zorder=2)
+    b2 = ax.bar(x + w / 2, graph, w, color=BLUE, label="Graph replay", zorder=2)
 
     for bars, vals in ((b1, eager), (b2, graph)):
         for rect, v in zip(bars, vals):
             ax.text(rect.get_x() + rect.get_width() / 2, v + 0.07, f"{v:.2f}",
-                    ha="center", va="bottom", fontsize=11, color=INK, fontweight="semibold")
+                    ha="center", va="bottom", fontsize=11, color=INK, fontweight="bold")
     for i, r in enumerate(rows):
         ax.text(x[i] + w / 2, r["graph_ms"] + 0.42, f"{r['speedup']:.1f}×",
-                ha="center", va="bottom", fontsize=11, color=BLUE, fontweight="semibold")
+                ha="center", va="bottom", fontsize=11, color=BLUE, fontweight="bold")
 
     _style(ax)
     ax.set_xticks(x)
@@ -740,7 +811,7 @@ def plot_decode(D) -> None:
     p_lo = min(r["pct_of_60fps"] for r in rows)
     p_hi = max(r["pct_of_60fps"] for r in rows)
     _heading(fig, "Single-step decode",
-             f"CUDA graph is {lo:.1f}–{hi:.1f}× faster than eager, "
+             f"Graph replay is {lo:.1f}–{hi:.1f}× faster than eager, "
              f"{p_lo:.1f}–{p_hi:.1f}% of a 16.7 ms frame", axes_title=False)
     m = D.get("decode_bench_params", {"batch": 64, "n_layer": 3, "d_model": 320})
     _footer(fig, f"{D['gpu']}  ·  fp32, {m['n_layer']} layers, batch {m['batch']}, "
@@ -777,7 +848,7 @@ def plot_stability(D) -> None:
     ax_d.plot(steps, running, color=BLUE, label="running max")
     ax_d.annotate(f"{running[-1]:.1e} after {len(err)} steps",
                   (steps[-1], running[-1]), textcoords="offset points", xytext=(-8, -20),
-                  ha="right", va="top", color=BLUE, fontsize=11.5, fontweight="semibold")
+                  ha="right", va="top", color=BLUE, fontsize=11.5, fontweight="bold")
     _style(ax_d, log=True)
     ax_d.set_yscale("log")
     ax_d.set_ylim(2e-7, 6e-6)
@@ -833,7 +904,7 @@ def plot_long_context(D) -> None:
             ax.annotate(f"{last[kr] / last[kc]:.0f}× {unit} at {last['seqlen'] // 1024}k",
                         (last["seqlen"], last[kc]), textcoords="offset points",
                         xytext=(-8, 12), ha="right", color=TEAL, fontsize=11.5,
-                        fontweight="semibold")
+                        fontweight="bold")
 
     _heading(fig, "What makes long sequences trainable at all",
              "Backprop through L Python steps is the wall a readable reference hits —",
@@ -844,6 +915,52 @@ def plot_long_context(D) -> None:
     _save(fig, "long_context.png")
 
 
+def plot_compile(D) -> None:
+    rows = D.get("compile_bench")
+    if not rows:
+        return
+    tags = [("eager", "Eager"), ("compile", "torch.compile"),
+            ("graph", "Graph replay"), ("compile_graph", "Both")]
+    fig, ax = _single(height=4.3)
+    y = np.arange(len(tags))
+    h = 0.36
+
+    # A linear axis, not log: the point of the figure is that the last bar is a
+    # sliver, and a log axis would flatten exactly that.
+    ax.axhspan(y[-1] - 0.5, y[-1] + 0.5, color="#F3F6FD", zorder=0)
+    span = max(r["eager"] for r in rows)
+    for i, (r, color) in enumerate(zip(rows, (SLATE, BLUE))):
+        vals = [r[t] for t, _ in tags]
+        bars = ax.barh(y + (i - 0.5) * h, vals, h, color=color, zorder=2,
+                       label=f"batch {r['batch']}")
+        for rect, v, (tag, _) in zip(bars, vals, tags):
+            gain = "" if tag == "eager" else f"   {r['eager'] / v:.0f}×"
+            ax.text(v + span * 0.014, rect.get_y() + rect.get_height() / 2,
+                    f"{v:.3f} ms{gain}", va="center", ha="left", fontsize=10.5,
+                    color=INK, fontweight="bold" if tag == "compile_graph" else "normal")
+
+    _style(ax)
+    ax.yaxis.grid(False)
+    ax.xaxis.grid(True, color=GRID, linewidth=1.0)
+    ax.set_yticks(y)
+    ax.set_yticklabels([label for _, label in tags])
+    ax.invert_yaxis()
+    ax.set_xlim(0, span * 1.46)
+    ax.set_xlabel("Per-token latency  (ms)")
+    # Right of the middle rows: the only block of space the labels leave free,
+    # and it keeps the legend off the highlighted bottom row.
+    ax.legend(loc="center right", ncol=1, handlelength=1.5, labelspacing=0.5)
+
+    best = max(r["eager"] / r["compile_graph"] for r in rows)
+    worst = min(r["eager"] / r["compile_graph"] for r in rows)
+    _heading(fig, "Compilation and replay compose",
+             f"Each removes a different cost; together {worst:.0f}–{best:.0f}× "
+             f"faster than eager", axes_title=False)
+    _footer(fig, f"{D['gpu']}  ·  fp32, 3 layers, d_model=320, d_state=32",
+            "100 timed steps after 30 warmup")
+    _save(fig, "compile.png")
+
+
 def plot_all(D) -> None:
     plot_scan(D)
     plot_decode_scaling(D)
@@ -851,6 +968,7 @@ def plot_all(D) -> None:
     plot_training(D)
     plot_alignment(D)
     plot_decode(D)
+    plot_compile(D)
     plot_stability(D)
     plot_long_context(D)
 
