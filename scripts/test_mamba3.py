@@ -181,9 +181,9 @@ def test_step_dedicated_path(device) -> None:
                 s.normal_()
             u = torch.randn(batch, m.d_model, device=device)
 
-            z, x, B, C, dd_dt, dd_A, trap, angles = m._split_in_proj(u)
+            z, x, B, C, dd_dt, dd_A, trap_logit, angles = m._split_in_proj(u)
             DT, B, C, x, z, trap, A, angles = m._preprocess(
-                dd_A, dd_dt, B, C, x, z, trap, angles
+                dd_A, dd_dt, B, C, x, z, trap_logit, angles
             )
 
             if m.is_mimo:
@@ -203,15 +203,17 @@ def test_step_dedicated_path(device) -> None:
                               outproj_norm_eps=1e-5)
                 Z = z if not m.is_outproj_norm else None
 
+            # The step path takes the gate, the batched one takes the logit and
+            # applies the sigmoid itself; both end up on the same float32 value.
             got = _mamba3_step(
-                Q=C, K=B, V=x, ADT=A * DT, DT=DT, Trap=torch.logit(trap),
+                Q=C, K=B, V=x, ADT=A * DT, DT=DT, Trap=trap,
                 Q_bias=m.C_bias, K_bias=m.B_bias, Angles=angles, D=m.D, Z=Z,
                 Input_States=states, **shared,
             )
             ref = _mamba3_combined(
                 C.unsqueeze(1), B.unsqueeze(1), x.unsqueeze(1),
                 (A * DT).unsqueeze(-1), DT.unsqueeze(-1),
-                torch.logit(trap).unsqueeze(-1), m.C_bias, m.B_bias,
+                trap_logit.unsqueeze(-1), m.C_bias, m.B_bias,
                 angles.unsqueeze(1), m.D, None if Z is None else Z.unsqueeze(1),
                 chunk_size=m.chunk_size, Input_States=states, **shared,
             )

@@ -154,10 +154,15 @@ RMSNormGated = RMSNorm
 # where Bx_t[p, n] = Σ_r V_{t,r}[p] · K_{t,r}[n]
 #       alpha_t = dt_t·(1 - tr_t/2), beta_t = dt_t·tr_t/2
 
-# Below this length the reshape overhead of chunking outweighs its benefit (the
-# measured crossover is around L≈6), so we fall back to the step-by-step
-# recurrence. Mirrors the official split between batched forward and single-step
-# decode kernels.
+# Below this length the reshape traffic of chunking costs more than the matmuls
+# it enables, so the step-by-step recurrence is used instead. Where that turns
+# over depends on the shapes: measured at L=5..6 for SISO and L=4 under MIMO,
+# whose smaller chunk_size gives chunking less to work with. The lowest of those
+# is taken, so no configuration is pushed onto the slower path; the cost of
+# being conservative is that SISO at L=5 gives up about 10%.
+#
+# This split is on top of the one the official package makes between its
+# combined and step kernels, which _mamba3_step covers.
 _RECURRENT_MAX_LEN = 4
 
 
@@ -313,8 +318,16 @@ def _chunk_scan(V, K, Q, ADT, alpha, beta, ssm_state, v_state, k_state, chunk_si
     delta = (Vc * rank_weight(tail_decay * alphac)).transpose(-1, -2) @ Kc
     delta = delta + (Vsc * rank_weight(tail_decay * betac)).transpose(-1, -2) @ Ksc
 
-    # ---- Inter-chunk: propagate serially over chunks (nchunks is small, so the
-    # Python loop overhead is negligible) ----
+    # ---- Inter-chunk: propagate serially over chunks ----
+    # This is the serial part of the scan, L/Q iterations of two launches that
+    # cannot overlap: 8 of them at L=512, but 64 at L=4096, where they measure
+    # ~39% of the forward against ~19% at L=512.
+    #
+    # Folding the body into one addcmul does cut the forward by 7-18%, and was
+    # tried. Its backward costs more than a separate multiply and add, enough to
+    # lose 6% of forward+backward at L=4096, so the training path pays for the
+    # inference one. Making it conditional on grad mode would also make the
+    # numbers depend on whether a graph is being built.
     if ssm_state is None:
         ssm_state = torch.zeros(batch, nheads, headdim, d_state, device=dev, dtype=dtp)
     chunk_decay = torch.exp(cl[..., -1])                    # (B, nchunks, H)
@@ -456,7 +469,10 @@ def _mamba3_step(
 
     Arguments are exactly what Mamba3._preprocess returns, with no length axis:
 
-        Q, K:    (B, R, H, N)    V: (B, H, P)    ADT, DT, Trap: (B, H)
+        Q, K:    (B, R, H, N)    V: (B, H, P)    ADT, DT: (B, H)
+        Trap:    (B, H)          the gate itself, sigmoid already applied, as
+                                 the official step kernel takes it — unlike
+                                 _mamba3_combined, which takes the logit
         Angles:  (B, H, S)       Q_bias, K_bias: (H, R, N)    D: (H,)
         Z:       (B, H, P) or None
 
@@ -471,8 +487,7 @@ def _mamba3_step(
 
     ADT = ADT.float()
     DT = DT.float()
-    trap = torch.sigmoid(Trap.float())
-    half = 0.5 * trap
+    half = 0.5 * Trap
     alpha = DT * (1.0 - half)
     beta = DT * half
 
@@ -715,14 +730,18 @@ class Mamba3(nn.Module):
             f"to form rotation pairs"
         )
 
-        # Order: [z, x, B, C, dd_dt, dd_A, trap, angle]
-        d_in_proj = (
-            2 * self.d_inner
-            + 2 * self.d_state * self.num_bc_heads * self.mimo_rank
-            + 3 * self.nheads
-            + self.num_rope_angles
+        # Order: [z, x, B, C, dd_dt, dd_A, trap, angle]. Held as the split widths
+        # rather than just their total: decoding splits once per layer per token
+        # on a path where Python is the cost, and the width of the projection is
+        # the sum either way.
+        d_bc = self.d_state * self.num_bc_heads * self.mimo_rank
+        self._in_proj_splits = (
+            self.d_inner, self.d_inner, d_bc, d_bc,
+            self.nheads, self.nheads, self.nheads, self.num_rope_angles,
         )
-        self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=False, **factory_kwargs)
+        self.in_proj = nn.Linear(
+            self.d_model, sum(self._in_proj_splits), bias=False, **factory_kwargs
+        )
 
         # dt_bias parameterization
         _dt = torch.exp(
@@ -793,20 +812,7 @@ class Mamba3(nn.Module):
 
     def _split_in_proj(self, u):
         """Split the fused projection into [z, x, B, C, dd_dt, dd_A, trap, angle]."""
-        return torch.split(
-            self.in_proj(u),
-            [
-                self.d_inner,
-                self.d_inner,
-                self.d_state * self.num_bc_heads * self.mimo_rank,
-                self.d_state * self.num_bc_heads * self.mimo_rank,
-                self.nheads,
-                self.nheads,
-                self.nheads,
-                self.num_rope_angles,
-            ],
-            dim=-1,
-        )
+        return torch.split(self.in_proj(u), self._in_proj_splits, dim=-1)
 
     # -- Forward ------------------------------------------------------------
 
@@ -897,6 +903,9 @@ class Mamba3(nn.Module):
                 outproj_norm_eps=self.norm.eps if self.fuse_pregate_headwise_norm else 1e-5,
                 Input_States=input_states,
             )
+            # *rest is empty for both scans here and upstream; it is kept because
+            # upstream keeps it, so a kernel that grows its return tuple does not
+            # break this line.
             if ssm_state is not None:
                 y, last_angle, last_state, last_k, last_v, *rest = y
                 angle_dt_state.copy_(last_angle)
@@ -941,10 +950,18 @@ class Mamba3(nn.Module):
         return out
 
     def _preprocess(self, A_proj, dd_dt, B, C, x, z, trap_proj, angle_proj):
+        """Per-token counterpart of the projection handling in forward.
+
+        The sigmoid is taken in float32, where the official method takes it in
+        the input dtype. Its consumer is the step kernel, which is also where
+        the gate is used; in bfloat16 the sigmoid saturates to exactly 1 well
+        before float32 does, which would put decode on a different gate value
+        than the batched path computes for the same token.
+        """
         _A = -heavy_tail_activation(A_proj.to(torch.float32))
         _A = torch.clamp(_A, max=-self.A_floor)
         DT = F.softplus(dd_dt + self.dt_bias)
-        trap = torch.sigmoid(trap_proj)
+        trap = torch.sigmoid(trap_proj.float())
 
         B = B.unflatten(-1, (self.mimo_rank, self.num_bc_heads, self.d_state))
         C = C.unflatten(-1, (self.mimo_rank, self.num_bc_heads, self.d_state))
@@ -992,7 +1009,7 @@ class Mamba3(nn.Module):
             V=x,
             ADT=A * DT,
             DT=DT,
-            Trap=torch.logit(trap),
+            Trap=trap,      # already a gate, not a logit; see _mamba3_step
             Angles=angles,
             D=self.D,
             Q_bias=self.C_bias,
