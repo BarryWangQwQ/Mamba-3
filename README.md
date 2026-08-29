@@ -336,19 +336,19 @@ One consequence of dropping `torch.cuda.graph` is worth naming: it captured on a
 
 ### Mamba-3 vs Mamba-2
 
-1. **Exponential-trapezoidal discretization**
+**1. Exponential-trapezoidal discretization.**
 
-   ```math
-   h_t = e^{A\, \mathrm{dt}_t}\, h_{t-1}
-       + \mathrm{dt}_t \Big[ (1 - \mathrm{tr}_t)\, Bx_t
-       + \mathrm{tr}_t\, \frac{Bx_t + Bx_{t-1}}{2} \Big]
-   ```
+```math
+h_t = e^{A\, \mathrm{dt}_t}\, h_{t-1}
+    + \mathrm{dt}_t \Big[ (1 - \mathrm{tr}_t)\, Bx_t
+    + \mathrm{tr}_t\, \frac{Bx_t + Bx_{t-1}}{2} \Big]
+```
 
-   `tr_t` is a learnable sigmoid gate: `tr=0` is Euler/ZOH, `tr=1` is full trapezoidal integration. Equivalent to $u_t = \alpha_t Bx_t + \beta_t Bx_{t-1}$ with $\alpha_t = \mathrm{dt}_t (1 - \mathrm{tr}_t / 2)$ and $\beta_t = \mathrm{dt}_t\, \mathrm{tr}_t / 2$, which keeps the recurrence linear in `(X, B)`.
+`tr_t` is a learnable sigmoid gate: `tr=0` is Euler/ZOH, `tr=1` is full trapezoidal integration. Equivalent to $u_t = \alpha_t Bx_t + \beta_t Bx_{t-1}$ with $\alpha_t = \mathrm{dt}_t (1 - \mathrm{tr}_t / 2)$ and $\beta_t = \mathrm{dt}_t\, \mathrm{tr}_t / 2$, which keeps the recurrence linear in `(X, B)`.
 
-2. **Complex (rotary) state space.** RoPE on `B` / `C`, angles scaled by `dt` and accumulated over time, so a real-valued state can express periodic dependencies.
+**2. Complex (rotary) state space.** RoPE on `B` / `C`, angles scaled by `dt` and accumulated over time, so a real-valued state can express periodic dependencies.
 
-3. **MIMO.** A rank-`R` projection turns the state write into a matmul. Persistent state stays `(B, H, P, N)`; `R` appears only on the read/write paths.
+**3. MIMO.** A rank-`R` projection turns the state write into a matmul. Persistent state stays `(B, H, P, N)`; `R` appears only on the read/write paths.
 
 ```
 B batch | L seqlen | H nheads | P headdim | N d_state
