@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/architecture.png" width="560" alt="The data path of one Mamba-3 layer">
+  <img src="assets/architecture.png" width="600" alt="The data path of one Mamba-3 layer">
 </p>
 
 Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you have Mamba-3 on whatever device PyTorch is already using: SISO and MIMO, chunked prefill, single-step decode, graph replay that composes with `torch.compile`, gradients included.
@@ -27,7 +27,7 @@ Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you ha
 **Not a lookalike.** What this file replaces is the official *kernel backend*, not the interface — which is why [the official usage snippet](#install) runs on it with only its import line changed.
 
 <p align="center">
-  <img src="assets/headline.png" width="560" alt="70x faster scan, 0.075 ms compiled decode, 247x smaller state, 1.1e-6 max error">
+  <img src="assets/headline.png" width="600" alt="70x faster prefill scan, 200x faster training at 4k, 0.075 ms per decoded token, 247x smaller than a KV cache, 1.1e-6 max error vs a full forward, one file with no custom kernels">
 </p>
 
 ---

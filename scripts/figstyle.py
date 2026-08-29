@@ -41,6 +41,7 @@ FILL = {
     CORAL: "#FBEEE6",
     PLUM: "#F1EBFB",
     BLUE: "#E9EEFC",
+    SLATE: "#F1F3F6",
 }
 
 # One scale for every figure. Raising a number here raises it everywhere, which
