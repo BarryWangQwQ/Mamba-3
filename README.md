@@ -314,9 +314,10 @@ python scripts/stats_figure.py     # redraw the headline numbers
 
 **Chunked parallel scan.** Unrolling the linear recurrence gives
 
-```
-h_t = exp(cs_t) · h_{-1} + Σ_{s≤t} exp(cs_t - cs_s) · u_s ,
-cs_t = Σ_{k≤t} A_k · dt_k
+```math
+h_t = e^{\mathrm{cs}_t}\, h_{-1} + \sum_{s \le t} e^{\mathrm{cs}_t - \mathrm{cs}_s}\, u_s,
+\qquad
+\mathrm{cs}_t = \sum_{k \le t} A_k\, \mathrm{dt}_k
 ```
 
 Split into chunks of length `Q`: every `(i, j)` pair inside a chunk is one matmul, and only `L/Q` states move serially. Training uses this path; decoding uses the step-by-step recurrence.
@@ -337,11 +338,13 @@ One consequence of dropping `torch.cuda.graph` is worth naming: it captured on a
 
 1. **Exponential-trapezoidal discretization**
 
-   ```
-   h_t = exp(A·dt_t)·h_{t-1} + dt_t·[(1-tr_t)·Bx_t + tr_t·(Bx_t + Bx_{t-1})/2]
+   ```math
+   h_t = e^{A\, \mathrm{dt}_t}\, h_{t-1}
+       + \mathrm{dt}_t \Big[ (1 - \mathrm{tr}_t)\, Bx_t
+       + \mathrm{tr}_t\, \frac{Bx_t + Bx_{t-1}}{2} \Big]
    ```
 
-   `tr_t` is a learnable sigmoid gate: `tr=0` is Euler/ZOH, `tr=1` is full trapezoidal integration. Equivalent to `u_t = α_t·Bx_t + β_t·Bx_{t-1}` with `α_t = dt_t·(1 - tr_t/2)` and `β_t = dt_t·tr_t/2`, which keeps the recurrence linear in `(X, B)`.
+   `tr_t` is a learnable sigmoid gate: `tr=0` is Euler/ZOH, `tr=1` is full trapezoidal integration. Equivalent to $u_t = \alpha_t Bx_t + \beta_t Bx_{t-1}$ with $\alpha_t = \mathrm{dt}_t (1 - \mathrm{tr}_t / 2)$ and $\beta_t = \mathrm{dt}_t\, \mathrm{tr}_t / 2$, which keeps the recurrence linear in `(X, B)`.
 
 2. **Complex (rotary) state space.** RoPE on `B` / `C`, angles scaled by `dt` and accumulated over time, so a real-valued state can express periodic dependencies.
 
