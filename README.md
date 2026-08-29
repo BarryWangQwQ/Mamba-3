@@ -38,7 +38,17 @@ Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you ha
 pip install torch
 ```
 
-The usage example from the official README runs here as written — the import line is the only edit:
+A layer is a drop-in for self-attention — same shape in, same shape out, and a width is the only argument it needs:
+
+```python
+import torch
+from mamba3 import Mamba3
+
+layer = Mamba3(d_model=768)              # SISO, upstream defaults
+y = layer(torch.randn(2, 2048, 768))     # (B, L, D) → (B, L, D)
+```
+
+And the official README's own example runs here as written — the import line is the only edit:
 
 ```python
 import torch
@@ -61,7 +71,7 @@ y = model(x)
 assert y.shape == x.shape
 ```
 
-That snippet is the shortest description of this project: same class, same arguments, same defaults, backward included, and nothing to build. Arguments it does not show (`rope_fraction`, `ngroups`, `expand`, `dt_min` …) are upstream's too.
+Arguments neither example shows (`rope_fraction`, `ngroups`, `expand`, `dt_min` …) are upstream's as well, with upstream's defaults.
 
 `"cuda"` is just what upstream wrote. Any device PyTorch has will do — `torch.accelerator.current_accelerator()` returns the one it picked, and plain CPU is fine.
 
