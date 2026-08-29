@@ -12,6 +12,7 @@ import argparse
 import json
 import statistics
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -21,6 +22,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from figstyle import (BLUE, CORAL, FAINT, FOOT, GRID, INK, LABEL, META, MUTED,
+                      NAVY, NOTE, PLUM, SEMI, SLATE, SUB, TEAL, TITLE, use_style)
 
 ROOT = Path(__file__).resolve().parent.parent
 # python puts this file's directory on sys.path, not the one it was launched
@@ -43,47 +47,11 @@ ASSETS.mkdir(exist_ok=True)
 # --------------------------------------------------------------------------
 # Style
 # --------------------------------------------------------------------------
-INK = "#1A1D23"
-MUTED = "#5C6370"
-HAIR = "#D5D8DE"
-GRID = "#EEF0F3"
-TEAL = "#0F7B6C"
-CORAL = "#C45C26"
-NAVY = "#1E3A5F"
-BLUE = "#1D4ED8"
-SLATE = "#64748B"
-PLUM = "#7C3AED"
+# Narrow canvas, large type: the image is nearly always scaled down to a column
+# width, and that shrinks the text with it. See figstyle.
+WIDTH = 6.4
 
-# Figures are read on GitHub, often on a phone where the image is scaled to the
-# device width. A narrow canvas with large type survives that; a wide one does not.
-WIDTH = 6.8
-
-plt.rcParams.update({
-    "font.family": ["Segoe UI", "DejaVu Sans"],
-    "font.size": 12.0,
-    "axes.titlesize": 13.0,
-    "axes.labelsize": 12.0,
-    "axes.labelcolor": INK,
-    "axes.edgecolor": HAIR,
-    "axes.linewidth": 0.9,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-    "text.color": INK,
-    "xtick.labelsize": 11.5,
-    "ytick.labelsize": 11.5,
-    "xtick.color": MUTED,
-    "ytick.color": MUTED,
-    "xtick.major.size": 0,
-    "ytick.major.size": 0,
-    "figure.facecolor": "white",
-    "axes.facecolor": "white",
-    "legend.frameon": False,
-    "legend.fontsize": 10.8,
-    "lines.linewidth": 2.2,
-    "savefig.dpi": 200,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.22,
-})
+use_style()
 
 
 def _style(ax, *, log=False):
@@ -92,7 +60,6 @@ def _style(ax, *, log=False):
     if log:
         ax.yaxis.grid(True, color=GRID, linewidth=0.6, which="minor")
     ax.xaxis.grid(False)
-    ax.tick_params(axis="both", pad=4)
 
 
 def _single(height=4.2):
@@ -107,31 +74,96 @@ def _stacked(height=7.0, ratios=(1, 1), share_x=False):
     """
     fig, axes = plt.subplots(2, 1, figsize=(WIDTH, height), sharex=share_x,
                              gridspec_kw={"height_ratios": list(ratios)})
-    fig.subplots_adjust(hspace=0.30 if share_x else 0.44)
+    fig.subplots_adjust(hspace=0.34 if share_x else 0.50)
     return fig, axes
 
 
-def _heading(fig, title: str, *subtitle: str, axes_title: bool = True) -> None:
-    """Title and subtitle in the margin reserved above the axes.
+def _left(fig) -> float:
+    """Left edge of the axes including their tick labels, in figure fractions.
+
+    Headings sit here rather than at the canvas edge. The axes are inset by
+    whatever the y tick labels need, which varies per figure, so a heading at
+    x=0 lands a ragged distance to the left of the plot it belongs to. Aligning
+    to the tick labels puts the title, the panel titles and the leftmost label
+    on one line.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    return min(ax.get_tightbbox(renderer).x0 for ax in fig.axes) / fig.bbox.width
+
+
+def _heading(fig, title: str, subtitle: str = "", *, axes_title: bool = True) -> None:
+    """Title, and at most one line under it, above the axes.
+
+    One line by design. A figure competes with the prose around it, and a
+    caption long enough to explain the figure is a caption the reader will skip
+    along with the figure; the explaining belongs in the README.
 
     The reserved band includes room for the first panel's own title, which is
     drawn above its axes and would otherwise land on the subtitle.
     """
     h = fig.get_figheight()
-    fig.subplots_adjust(top=1.0 - (0.30 + 0.32 * axes_title + 0.21 * len(subtitle)) / h)
-    y = 1.0 - 0.04 / h
-    fig.text(0.0, y, title, fontsize=15.0, fontweight="bold", color=INK, va="top")
-    for i, line in enumerate(subtitle):
-        y -= (0.30 if i == 0 else 0.21) / h
-        fig.text(0.0, y, line, fontsize=11.0, color=MUTED, va="top")
+    fig.subplots_adjust(top=1.0 - (0.40 + 0.40 * axes_title + 0.26 * bool(subtitle)) / h)
+    x = _left(fig)
+
+    # Panel titles default to the spine, which is inset from the tick labels the
+    # heading lines up with. Pull them out so every left edge in the figure is
+    # the same one.
+    for ax in fig.axes:
+        label = ax.get_title(loc="left")
+        if label:
+            pos = ax.get_position()
+            ax.set_title(label, loc="left", x=(x - pos.x0) / pos.width)
+
+    fig.text(x, 1.0 - 0.04 / h, title, fontsize=TITLE, fontweight="bold",
+             color=INK, va="top")
+    if subtitle:
+        fig.text(x, 1.0 - 0.35 / h, subtitle, fontsize=SUB, color=MUTED, va="top")
 
 
-def _footer(fig, *lines: str) -> None:
-    h = fig.get_figheight()
-    y = -0.06 / h
-    for line in lines:
-        fig.text(0.0, y, line, fontsize=9.6, color=MUTED, va="top")
-        y -= 0.17 / h
+def _footer(fig, setup: str) -> None:
+    """The setup needed to read the numbers: hardware and shape.
+
+    Deliberately the quietest thing on the canvas — small and pale, set well
+    below the axes. It is the same line on every figure, so at full strength it
+    reads as part of the plot and competes with it; at this weight it stays
+    findable by anyone who wants to know what the numbers were measured on, and
+    invisible to everyone else. Method notes are in the README, which is where
+    someone questioning a number actually looks.
+
+    Placed under whatever the bottom axes actually ends at, measured rather than
+    assumed: a panel with an x label reaches further down than one with only
+    tick labels, and a fixed offset that clears the first collides with the
+    second.
+
+    Wrapped to the width of the axes, because savefig crops to the widest thing
+    on the canvas — so a footer allowed to overrun does not spill, it shrinks
+    the figure it belongs to.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = [ax.get_tightbbox(renderer) for ax in fig.axes]
+    y = min(b.y0 for b in boxes) / fig.bbox.height - 0.26 / fig.get_figheight()
+    width = max(b.x1 for b in boxes) - min(b.x0 for b in boxes)
+    x = _left(fig)
+
+    line = fig.text(x, y, setup, fontsize=META, color=FAINT, va="top")
+    # A few percent over is not worth a second line: the figure grows by less
+    # than the line costs.
+    if line.get_window_extent(renderer).width <= width * 1.06:
+        return
+    line.remove()
+    per_char = len(setup) / max(1.0, _text_width(fig, setup, renderer))
+    for i, part in enumerate(textwrap.wrap(setup, int(width * per_char))):
+        fig.text(x, y - i * 0.14 / fig.get_figheight(), part, fontsize=META,
+                 color=FAINT, va="top")
+
+
+def _text_width(fig, text: str, renderer) -> float:
+    probe = fig.text(0.0, -1.0, text, fontsize=META)
+    width = probe.get_window_extent(renderer).width
+    probe.remove()
+    return width
 
 
 def _save(fig, name: str) -> None:
@@ -580,12 +612,17 @@ def plot_scan(D) -> None:
     for tag, color in (("SISO", TEAL), ("MIMO(R=2)", CORAL)):
         sel = [r for r in rows if r["tag"] == tag]
         xs = [r["seqlen"] for r in sel]
-        ax_t.plot(xs, [r["recurrent_ms"] for r in sel], color=color, ls=(0, (3.2, 2.2)), lw=1.9,
-                  marker="o", ms=6.5, mfc="white", mew=1.8, label=f"{tag}  recurrent")
-        ax_t.plot(xs, [r["chunked_ms"] for r in sel], color=color,
-                  marker="s", ms=5.8, label=f"{tag}  chunked")
+        ax_t.plot(xs, [r["recurrent_ms"] for r in sel], color=color, ls=(0, (3.2, 2.2)),
+                  lw=1.9, marker="o", ms=6.5, mfc="white", mew=1.8, label=tag)
+        ax_t.plot(xs, [r["chunked_ms"] for r in sel], color=color, marker="s", ms=5.8)
         ax_s.plot(xs, [r["speedup"] for r in sel], color=color,
-                  marker="o", ms=7.0, mfc="white", mew=1.9, label=tag)
+                  marker="o", ms=7.0, mfc="white", mew=1.9)
+
+    # The legend carries colour only, so line style is spelled out once, on the
+    # title line where no data can run through it. The lower panel then needs no
+    # legend at all: same two colours, directly below.
+    ax_t.text(1.0, 1.015, "dashed step-by-step   ·   solid chunked", ha="right",
+              va="bottom", transform=ax_t.transAxes, color=MUTED, fontsize=FOOT)
 
     for ax in (ax_t, ax_s):
         _style(ax)
@@ -593,27 +630,23 @@ def plot_scan(D) -> None:
         ax.set_xticklabels(["32", "", "128", "256", "512"])
         ax.set_xlim(16, 568)
     ax_s.set_xlabel("Sequence length")
-    ax_t.set_title("Scan time", loc="left")
-    ax_s.set_title("Speedup over the recurrence", loc="left")
-    ax_t.set_ylabel("Milliseconds")
-    ax_s.set_ylabel("× faster")
+    ax_t.set_title("Scan time  (ms)", loc="left")
+    ax_s.set_title("Speedup over the recurrence  (×)", loc="left")
     ax_t.set_ylim(0, 80)
     ax_s.set_ylim(0, 78)
-    ax_t.legend(loc="upper left", ncol=2, columnspacing=1.0, handlelength=1.8)
-    ax_s.legend(loc="upper left")
+    ax_t.legend(loc="upper left", ncol=2, columnspacing=1.4, handlelength=1.8)
     ax_t.yaxis.set_major_locator(mticker.MultipleLocator(20))
     ax_s.yaxis.set_major_locator(mticker.MultipleLocator(20))
 
     tail = [r["speedup"] for r in rows if r["seqlen"] == seqlens[-1]]
     lo, hi = round(min(tail)), round(max(tail))
     ax_s.annotate(f"{lo}×" if lo == hi else f"{lo}–{hi}×",
-                  (seqlens[-1], max(tail)), textcoords="offset points", xytext=(-8, 10),
-                  ha="right", color=INK, fontsize=12, fontweight="bold")
+                  (seqlens[-1], max(tail)), textcoords="offset points", xytext=(-8, 12),
+                  ha="right", color=INK, fontsize=NOTE, fontweight="bold")
 
     _heading(fig, "Chunked GEMM vs step-by-step recurrence",
-             "Recurrent cost grows linearly with L; the chunked path stays near 1 ms")
-    _footer(fig, f"{D['gpu']}  ·  fp32, B=3, H=4, P=16, N=32",
-            "SISO chunk=64, MIMO(R=2) chunk=32")
+             "Recurrent cost grows with L; the chunked path stays near 1 ms")
+    _footer(fig, f"{D['gpu']}  ·  fp32, B=3, H=4, P=16, N=32  ·  chunk 64 / 32")
     _save(fig, "scan.png")
 
 
@@ -634,28 +667,26 @@ def plot_decode_scaling(D) -> None:
 
     last = rows[-1]
     ax_m.annotate(f"{last['attn_cache_mb'] / last['mamba_state_mb']:.0f}× smaller at 16k",
-                  (xs[-1], last["mamba_state_mb"]), textcoords="offset points", xytext=(-8, 14),
-                  ha="right", color=TEAL, fontsize=11.5, fontweight="bold")
+                  (xs[-1], last["mamba_state_mb"]), textcoords="offset points", xytext=(-8, 16),
+                  ha="right", color=TEAL, fontsize=NOTE, fontweight="bold")
 
     for ax in (ax_t, ax_m):
         _style(ax, log=True)
         ax.set_xscale("log", base=2)
         ax.set_xticks(xs)
         ax.set_xticklabels([f"{v // 1024}k" if v >= 1024 else str(v) for v in xs])
-        ax.legend(loc="upper left")
+    ax_t.legend(loc="upper left")
     ax_m.set_xlabel("Context already consumed  (tokens)")
-    ax_t.set_ylabel("Decode latency  (ms)")
-    ax_m.set_ylabel("Per layer  (MiB, log)")
     ax_m.set_yscale("log")
     ax_t.set_ylim(0, max(r["attn_ms"] for r in rows) * 1.12)
-    ax_t.set_title("One more token, whatever the context", loc="left")
-    ax_m.set_title("What has to be kept around", loc="left")
+    ax_t.set_title("One more token, whatever the context  (ms)", loc="left")
+    ax_m.set_title("What has to be kept around  (MiB per layer)", loc="left")
 
     _heading(fig, "Constant state vs a growing KV cache",
-             "Decode cost and memory do not depend on how much context came before")
+             "Decode cost and memory do not depend on the context behind them")
     _footer(fig, f"{D['gpu']}  ·  fp32, one layer, B={meta['batch']}, "
-                 f"d_model={meta['d_model']}, {meta['nheads']} heads",
-            "Baseline: PyTorch SDPA over a preallocated cache. Eager path — graph replay is faster.")
+                 f"d_model={meta['d_model']}, {meta['nheads']} heads  ·  "
+                 f"baseline: PyTorch SDPA")
     _save(fig, "decode_scaling.png")
 
 
@@ -668,38 +699,41 @@ def plot_chunk(D) -> None:
         ax_e.plot([r["chunk_size"] for r in sel], [r["err"] for r in sel], color=color, lw=2.0,
                   marker="o", ms=6.0, mfc="white", mew=1.7, label=f"R={rank}")
     ax_e.axhline(1e-4, color=SLATE, lw=1.0, ls=(0, (3, 2)))
-    ax_e.text(1.05, 1.2e-4, "test tolerance  1×10⁻⁴", color=MUTED, fontsize=10.5, va="bottom")
+    # Exponents are written 1e-4 rather than 1×10⁻⁴: the figure font has the
+    # superscript digits but no superscript minus, and e-notation matches the
+    # formatted values elsewhere in these figures anyway.
+    ax_e.text(1.05, 1.25e-4, "test tolerance  1e-4", color=MUTED, fontsize=FOOT,
+              va="bottom")
 
     for i, (rank, color) in enumerate(((1, TEAL), (2, CORAL))):
         sel = [r for r in speed if r["rank"] == rank]
         ax_t.plot([r["chunk_size"] for r in sel], [r["ms"] for r in sel], color=color,
                   marker="s", ms=6.0, label=f"R={rank}")
         best = min(sel, key=lambda r: r["ms"])
-        ax_t.text(0.35, 0.92 - 0.11 * i, f"R={rank} fastest at Q={best['chunk_size']}",
-                  transform=ax_t.transAxes, color=color, fontsize=11.5, fontweight="bold")
+        ax_t.text(0.33, 0.90 - 0.13 * i, f"R={rank} fastest at Q={best['chunk_size']}",
+                  transform=ax_t.transAxes, color=color, fontsize=NOTE,
+                  fontweight=SEMI)
 
     for ax in (ax_e, ax_t):
         _style(ax, log=True)
         ax.set_xscale("log", base=2)
         ax.set_xlabel("Chunk size Q")
+    # Only the upper panel gets a legend; below, the two coloured callouts name
+    # their own series.
     ax_e.legend(loc="center left", ncol=3, columnspacing=1.2, handlelength=1.8)
-    ax_t.legend(loc="lower left")
     ax_e.set_yscale("log")
     ax_e.set_xticks([1, 4, 16, 64, 256])
     ax_e.set_xticklabels(["1", "4", "16", "64", "256"])
     ax_e.set_ylim(2e-6, 3e-4)
-    ax_e.set_ylabel("max |Δ|  vs recurrence")
-    ax_e.set_title("Every chunk size agrees", loc="left")
+    ax_e.set_title("Every chunk size agrees  (max |Δ| vs recurrence)", loc="left")
     ax_t.set_xticks([8, 16, 32, 64, 128, 256])
     ax_t.set_xticklabels(["8", "16", "32", "64", "128", "256"])
-    ax_t.set_ylabel("Milliseconds")
-    ax_t.set_title("Only the speed moves", loc="left")
+    ax_t.set_title("Only the speed moves  (ms)", loc="left")
 
     _heading(fig, "Chunk size is a performance knob, not a correctness one",
-             "Q partitions the same algebra, so the result holds while the GEMM shape changes",
-             "— and the fastest Q sits at or just above the default 64 / rank")
-    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  error: B=3, L=256, H=4, P=16, N=32",
-            "Timing: B=8, L=512, H=6, P=64, N=64")
+             "Q partitions the same algebra; only the GEMM shape changes")
+    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  "
+                 f"error at L=256, timing at L=512")
     _save(fig, "chunk_size.png")
 
 
@@ -720,29 +754,26 @@ def plot_training(D) -> None:
         ax.set_xscale("log", base=2)
         ax.set_xticks([128, 256, 512, 1024, 2048])
         ax.set_xticklabels(["128", "256", "512", "1k", "2k"])
-    ax_t.legend(loc="upper left")
-    ax_p.legend(loc="upper center", ncol=2, columnspacing=1.4)
+    ax_t.legend(loc="upper left")            # same two colours below, said once
     ax_p.set_xlabel("Sequence length")
-    ax_t.set_ylabel("Fwd + bwd  (ms)")
-    ax_p.set_ylabel("Microseconds / token")
     ax_t.set_ylim(bottom=0)
     ax_p.set_ylim(bottom=0)
-    ax_t.set_title("Training step", loc="left")
-    ax_p.set_title("Cost per token", loc="left")
+    ax_t.set_title("Forward + backward  (ms)", loc="left")
+    ax_p.set_title("Cost per token  (µs)", loc="left")
 
     _heading(fig, "Autograd straight through the chunked scan",
-             "Per-token cost bottoms out near L≈512–1024: launch overhead is amortized,",
-             "chunk intermediates still fit comfortably")
-    _footer(fig, f"{D['gpu']}  ·  fp32, B=8, d_model=384, N=64, P=64",
-            "One zero_grad + forward + backward per step, no custom kernel")
+             "Per-token cost bottoms out near L ≈ 512–1024")
+    _footer(fig, f"{D['gpu']}  ·  fp32, B=8, d_model=384, N=64, P=64")
     _save(fig, "training.png")
 
 
 def plot_alignment(D) -> None:
     rows = D["layer_alignment"]
     scan = D["scan_alignment"]
+    # "MIMO" is dropped from the last two: R=4 only exists there, and spelling it
+    # out makes those two tick labels touch.
     labels = ["SISO", "SISO\n+ norm", "SISO\nrope = 1",
-              "MIMO\nR=2", "MIMO R=4\n+ norm", "MIMO R=4\nunfused"]
+              "MIMO\nR=2", "R=4\n+ norm", "R=4\nunfused"]
 
     fig, (ax_l, ax_s) = _stacked(height=7.6, ratios=(1.15, 1.0))
 
@@ -756,12 +787,11 @@ def plot_alignment(D) -> None:
     ax_l.set_yscale("log")
     ax_l.set_ylim(8e-8, 3.2e-6)
     ax_l.axhline(1e-6, color=SLATE, lw=1.0, ls=(0, (3, 2)))
-    ax_l.text(len(rows) - 0.42, 1.15e-6, "1×10⁻⁶", color=MUTED, fontsize=10.5,
+    ax_l.text(len(rows) - 0.42, 1.2e-6, "1e-6", color=MUTED, fontsize=FOOT,
               ha="right", va="bottom")
     ax_l.set_xticks(x)
-    ax_l.set_xticklabels(labels, fontsize=10.0)
-    ax_l.set_ylabel("max |Δ|  vs full forward")
-    ax_l.set_title("Layer configs — resumed state vs one full forward", loc="left")
+    ax_l.set_xticklabels(labels, fontsize=11.2)
+    ax_l.set_title("Resumed state vs one full forward  (max |Δ|)", loc="left")
     ax_l.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
     xr = np.arange(len(scan))
@@ -773,16 +803,12 @@ def plot_alignment(D) -> None:
     ax_s.set_ylim(1e-8, 8e-5)
     ax_s.set_xticks(xr)
     ax_s.set_xticklabels([f"R={r['rank']}" for r in scan])
-    ax_s.set_ylabel("max |Δ|  vs recurrence")
-    ax_s.set_title("Chunked scan — forward and backward", loc="left")
+    ax_s.set_title("Chunked scan vs recurrence  (max |Δ|)", loc="left")
     ax_s.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
-    cg = D["graph_replay_max_abs_diff"]
     _heading(fig, "Numerical agreement",
-             f"Every alternative path reproduces the reference to ~10⁻⁶ or better.",
-             f"Graph replay vs eager decode: {cg:.1e}")
-    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 disabled  ·  B=3, L=40",
-            "Top: d_model=128, N=32.  Bottom: H=4, P=16, N=32, chunk=8")
+             "Every path reproduces the reference to ~1e-6 or better")
+    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  B=3, L=40")
     _save(fig, "alignment.png")
 
 
@@ -798,30 +824,27 @@ def plot_decode(D) -> None:
 
     for bars, vals in ((b1, eager), (b2, graph)):
         for rect, v in zip(bars, vals):
-            ax.text(rect.get_x() + rect.get_width() / 2, v + 0.07, f"{v:.2f}",
-                    ha="center", va="bottom", fontsize=11, color=INK, fontweight="bold")
+            ax.text(rect.get_x() + rect.get_width() / 2, v + 0.08, f"{v:.2f}",
+                    ha="center", va="bottom", fontsize=NOTE, color=INK,
+                    fontweight=SEMI)
     for i, r in enumerate(rows):
-        ax.text(x[i] + w / 2, r["graph_ms"] + 0.42, f"{r['speedup']:.1f}×",
-                ha="center", va="bottom", fontsize=11, color=BLUE, fontweight="bold")
+        ax.text(x[i] + w / 2, r["graph_ms"] + 0.50, f"{r['speedup']:.1f}×",
+                ha="center", va="bottom", fontsize=NOTE, color=BLUE, fontweight="bold")
 
     _style(ax)
     ax.set_xticks(x)
     ax.set_xticklabels([f"d_state = {r['d_state']}" for r in rows])
-    ax.set_ylabel("Per-frame latency  (ms)")
-    ax.set_ylim(0, max(eager) * 1.26)
+    ax.set_title("Per-frame latency  (ms)", loc="left")
+    ax.set_ylim(0, max(eager) * 1.30)
     ax.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.5)
 
     lo = min(r["speedup"] for r in rows)
     hi = max(r["speedup"] for r in rows)
-    p_lo = min(r["pct_of_60fps"] for r in rows)
-    p_hi = max(r["pct_of_60fps"] for r in rows)
     _heading(fig, "Single-step decode",
-             f"Graph replay is {lo:.1f}–{hi:.1f}× faster than eager, "
-             f"{p_lo:.1f}–{p_hi:.1f}% of a 16.7 ms frame", axes_title=False)
+             f"Graph replay removes the launch overhead: {lo:.1f}–{hi:.1f}× faster")
     m = D.get("decode_bench_params", {"batch": 64, "n_layer": 3, "d_model": 320})
     _footer(fig, f"{D['gpu']}  ·  fp32, {m['n_layer']} layers, batch {m['batch']}, "
-                 f"d_model={m['d_model']}",
-            "100 timed steps after 30 warmup")
+                 f"d_model={m['d_model']}")
     _save(fig, "decode.png")
 
 
@@ -834,7 +857,7 @@ def plot_stability(D) -> None:
     ax_l.plot(xs, [r["err_h"] for r in rows], color=CORAL, lw=2.0, marker="o", ms=6.5,
               mfc="white", mew=1.8, label="Final state h")
     ax_l.axhline(1e-6, color=SLATE, lw=1.0, ls=(0, (3, 2)))
-    ax_l.text(xs[0], 1.2e-6, "1×10⁻⁶", color=MUTED, fontsize=10.5, va="bottom")
+    ax_l.text(xs[0], 1.25e-6, "1e-6", color=MUTED, fontsize=FOOT, va="bottom")
     _style(ax_l, log=True)
     ax_l.set_xscale("log", base=2)
     ax_l.set_yscale("log")
@@ -842,8 +865,7 @@ def plot_stability(D) -> None:
     ax_l.set_xticklabels([f"{v // 1024}k" if v >= 1024 else str(v) for v in xs])
     ax_l.set_ylim(1e-7, 3e-5)
     ax_l.set_xlabel("Sequence length")
-    ax_l.set_ylabel("max |Δ|  vs recurrence")
-    ax_l.set_title("Chunked scan, L = 32 … 4k", loc="left")
+    ax_l.set_title("Chunked scan vs recurrence  (max |Δ|)", loc="left")
     ax_l.legend(loc="upper left", ncol=2, columnspacing=1.2, handlelength=1.8)
 
     err = np.maximum(np.asarray(drift["err"], dtype=float), 1e-12)
@@ -852,23 +874,22 @@ def plot_stability(D) -> None:
     ax_d.plot(steps, err, color="#C3C8D1", lw=0.8, label="per step")
     ax_d.plot(steps, running, color=BLUE, label="running max")
     ax_d.annotate(f"{running[-1]:.1e} after {len(err)} steps",
-                  (steps[-1], running[-1]), textcoords="offset points", xytext=(-8, -20),
-                  ha="right", va="top", color=BLUE, fontsize=11.5, fontweight="bold")
+                  (steps[-1], running[-1]), textcoords="offset points", xytext=(-8, 10),
+                  ha="right", va="bottom", color=BLUE, fontsize=NOTE, fontweight="bold")
     _style(ax_d, log=True)
     ax_d.set_yscale("log")
     ax_d.set_ylim(2e-7, 6e-6)
     ax_d.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax_d.set_xlim(0, len(err))
     ax_d.set_xlabel("Decode step")
-    ax_d.set_ylabel("max |Δ|  vs full forward")
-    ax_d.set_title("Streaming step(), one state carried forward", loc="left")
+    ax_d.set_title("Streaming step() vs one full forward  (max |Δ|)", loc="left")
+    # Below the noise band, which bottoms out well above the axis; the callout
+    # has the space above it.
     ax_d.legend(loc="lower right", ncol=2, columnspacing=1.2, handlelength=1.8)
 
     _heading(fig, "Error does not grow with length or with time",
-             "Chunking splits the same algebra, so a longer sequence adds no drift —",
-             "and neither does replaying a streaming state a thousand steps in a row")
-    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  top: B=3, H=4, P=16, N=32, chunk=64",
-            f"Bottom: B=2, d_model=128, N=32, P=32, {drift['steps']} consecutive steps")
+             "Neither a longer sequence nor a thousand streamed steps add drift")
+    _footer(fig, f"{D['gpu']}  ·  fp32, TF32 off  ·  chunk=64")
     _save(fig, "stability.png")
 
 
@@ -881,9 +902,9 @@ def plot_long_context(D) -> None:
         return ([r["seqlen"] for r in rows if r[key] is not None],
                 [r[key] for r in rows if r[key] is not None])
 
-    for ax, kc, kr, ylabel, title in (
-        (ax_t, "chunked_ms", "recurrent_ms", "Fwd + bwd  (ms, log)", "Training step"),
-        (ax_m, "chunked_mb", "recurrent_mb", "Peak allocated  (MiB)", "Autograd footprint"),
+    for ax, kc, kr, title in (
+        (ax_t, "chunked_ms", "recurrent_ms", "Forward + backward  (ms, log)"),
+        (ax_m, "chunked_mb", "recurrent_mb", "Autograd footprint  (MiB)"),
     ):
         ax.plot(*series(kr), color=CORAL, lw=2.0, marker="o", ms=6.5, mfc="white", mew=1.8,
                 ls=(0, (3.2, 2.2)), label="Step-by-step recurrence")
@@ -897,26 +918,27 @@ def plot_long_context(D) -> None:
             ax.yaxis.set_major_locator(mticker.MultipleLocator(1000))
         ax.set_xticks(xs)
         ax.set_xticklabels([f"{v // 1024}k" if v >= 1024 else str(v) for v in xs])
-        ax.set_ylabel(ylabel)
         ax.set_title(title, loc="left")
-        ax.legend(loc="upper left")
+    ax_t.legend(loc="upper left")            # same two colours below, said once
     ax_m.set_xlabel("Sequence length")
 
     last = rows[-1]
-    for ax, kc, kr, unit in ((ax_t, "chunked_ms", "recurrent_ms", "faster"),
-                             (ax_m, "chunked_mb", "recurrent_mb", "smaller")):
+    # Above the chunked line in the log panel, where the gap between the two
+    # series is wide; below it in the linear one, where the recurrence curve
+    # sweeps through that space.
+    for ax, kc, kr, unit, dy in ((ax_t, "chunked_ms", "recurrent_ms", "faster", 14),
+                                 (ax_m, "chunked_mb", "recurrent_mb", "smaller", -18)):
         if last[kc] and last[kr]:
             ax.annotate(f"{last[kr] / last[kc]:.0f}× {unit} at {last['seqlen'] // 1024}k",
                         (last["seqlen"], last[kc]), textcoords="offset points",
-                        xytext=(-8, 12), ha="right", color=TEAL, fontsize=11.5,
-                        fontweight="bold")
+                        xytext=(-8, dy), ha="right",
+                        va="bottom" if dy > 0 else "top",
+                        color=TEAL, fontsize=NOTE, fontweight="bold")
 
     _heading(fig, "What makes long sequences trainable at all",
-             "Backprop through L Python steps is the wall a readable reference hits —",
-             "in wall-clock time and in the size of the autograd graph")
+             "Backprop through L Python steps is the wall a plain reference hits")
     _footer(fig, f"{D['gpu']}  ·  fp32, B={meta['batch']}, H={meta['nheads']}, "
-                 f"P={meta['headdim']}, N={meta['d_state']}, chunk={meta['chunk_size']}",
-            "One zero_grad + forward + backward through the scan itself")
+                 f"P={meta['headdim']}, N={meta['d_state']}, chunk={meta['chunk_size']}")
     _save(fig, "long_context.png")
 
 
@@ -940,17 +962,17 @@ def plot_compile(D) -> None:
                        label=f"batch {r['batch']}")
         for rect, v, (tag, _) in zip(bars, vals, tags):
             gain = "" if tag == "eager" else f"   {r['eager'] / v:.0f}×"
-            ax.text(v + span * 0.014, rect.get_y() + rect.get_height() / 2,
-                    f"{v:.3f} ms{gain}", va="center", ha="left", fontsize=10.5,
+            ax.text(v + span * 0.016, rect.get_y() + rect.get_height() / 2,
+                    f"{v:.3f} ms{gain}", va="center", ha="left", fontsize=FOOT + 0.6,
                     color=INK, fontweight="bold" if tag == "compile_graph" else "normal")
 
     _style(ax)
     ax.yaxis.grid(False)
     ax.xaxis.grid(True, color=GRID, linewidth=1.0)
     ax.set_yticks(y)
-    ax.set_yticklabels([label for _, label in tags])
+    ax.set_yticklabels([label for _, label in tags], fontsize=LABEL)
     ax.invert_yaxis()
-    ax.set_xlim(0, span * 1.46)
+    ax.set_xlim(0, span * 1.50)
     ax.set_xlabel("Per-token latency  (ms)")
     # Right of the middle rows: the only block of space the labels leave free,
     # and it keeps the legend off the highlighted bottom row.
@@ -961,8 +983,7 @@ def plot_compile(D) -> None:
     _heading(fig, "Compilation and replay compose",
              f"Each removes a different cost; together {worst:.0f}–{best:.0f}× "
              f"faster than eager", axes_title=False)
-    _footer(fig, f"{D['gpu']}  ·  fp32, 3 layers, d_model=320, d_state=32",
-            "100 timed steps after 30 warmup")
+    _footer(fig, f"{D['gpu']}  ·  fp32, 3 layers, d_model=320, d_state=32")
     _save(fig, "compile.png")
 
 

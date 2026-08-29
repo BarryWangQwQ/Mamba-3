@@ -16,14 +16,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 
-from figstyle import (BLUE, CORAL, INK, MUTED, NAVY, PLUM, TEAL, WIRE, card, lh,
-                      use_style)
+from figstyle import (BLUE, CORAL, FAINT, FOOT, INK, META, MUTED, NAVY, PLUM,
+                      SUB, TEAL, TITLE, WIRE, card, lh, use_style)
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 ASSETS.mkdir(exist_ok=True)
 
 AX_W = 6.0
-HEAD_H, FOOT_H = 0.56, 0.40
+HEAD_H, FOOT_H = 0.66, 0.46
 RADIUS = 0.08
 MARGIN = 0.16
 
@@ -47,7 +47,7 @@ def box_h(title_size: float, n_lines: int, line_size: float, pad: float) -> floa
     return lh(title_size) + n_lines * lh(line_size) + pad
 
 
-def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=12.5, line_size=9.4):
+def box(ax, x0, x1, y0, y1, color, title, *lines, title_size=13.5, line_size=10.6):
     card(ax, x0, y0, x1, y1, color, RADIUS)
     block = lh(title_size) + len(lines) * lh(line_size)
     y = y1 - (y1 - y0 - block) / 2 - lh(title_size) / 2
@@ -78,10 +78,10 @@ def elbow(ax, pts, color=WIRE):
 
 def main() -> None:
     use_style()
-    z_h = box_h(12.0, 0, 9.4, 0.12)
-    chip_h = box_h(12.0, 1, 9.4, 0.13)
-    gate_h = box_h(12.5, 2, 9.4, 0.15)
-    out_h = box_h(12.5, 0, 9.4, 0.15)
+    z_h = box_h(13.0, 0, 10.6, 0.14)
+    chip_h = box_h(13.0, 1, 10.6, 0.15)
+    gate_h = box_h(13.5, 2, 10.6, 0.17)
+    out_h = box_h(13.5, 0, 10.6, 0.17)
 
     row1_h = z_h + GAP_Z + 3 * chip_h + 2 * GAP_CHIP
     ax_h = 2 * MARGIN + row1_h + GAP_ROW + gate_h
@@ -100,21 +100,21 @@ def main() -> None:
     spine = (chips_top + chips_bot) / 2                 # main flow through row 1
     row2 = chips_bot - GAP_ROW - gate_h / 2             # centre line of row 2
 
-    ax.text(0.14, spine, "u", ha="right", va="center", fontsize=13.0,
+    ax.text(0.14, spine, "u", ha="right", va="center", fontsize=14.0,
             fontweight="bold", color=INK)
     arrow(ax, 0.22, spine, X_IN[0] - 0.04, spine)
     box(ax, *X_IN, chips_bot, z_top, NAVY, "in_proj", "one fused Linear", "no bias")
 
     # z is the first slice of the projection, and the only one that skips the scan.
     z_cy = z_top - z_h / 2
-    box(ax, *X_CHIP, z_top - z_h, z_top, BLUE, "z", title_size=12.0)
+    box(ax, *X_CHIP, z_top - z_h, z_top, BLUE, "z", title_size=13.0)
     arrow(ax, X_IN[1], z_cy, X_CHIP[0] - 0.04, z_cy, color=BLUE)
 
     for i, (color, title, sub) in enumerate(CHIPS):
         y1 = chips_top - i * (chip_h + GAP_CHIP)
         cy = y1 - chip_h / 2
         arrow(ax, X_IN[1], cy, X_CHIP[0] - 0.04, cy)
-        box(ax, *X_CHIP, y1 - chip_h, y1, color, title, sub, title_size=12.0)
+        box(ax, *X_CHIP, y1 - chip_h, y1, color, title, sub, title_size=13.0)
         arrow(ax, X_CHIP[1], cy, X_SCAN[0] - 0.04, cy)
 
     box(ax, *X_SCAN, chips_bot, chips_top, NAVY, "selective scan",
@@ -131,19 +131,21 @@ def main() -> None:
     arrow(ax, X_GATE[0], row2, X_OUT[1] + 0.04, row2)
     box(ax, *X_OUT, row2 - out_h / 2, row2 + out_h / 2, NAVY, "out_proj")
     arrow(ax, X_OUT[0], row2, X_OUT[0] - 0.32, row2)
-    ax.text(X_OUT[0] - 0.40, row2, "out", ha="right", va="center", fontsize=13.0,
+    ax.text(X_OUT[0] - 0.40, row2, "out", ha="right", va="center", fontsize=14.0,
             fontweight="bold", color=INK)
 
-    fig.text(0.0, 1.0 - 0.05 / fig_h, "One Mamba-3 layer", fontsize=15.0,
+    fig.text(0.0, 1.0 - 0.05 / fig_h, "One Mamba-3 layer", fontsize=TITLE,
              fontweight="bold", color=INK, va="top")
-    fig.text(0.0, 1.0 - 0.32 / fig_h, "The data path, in the order mamba3.py runs it.",
-             fontsize=10.2, color=MUTED, va="top")
-    fig.text(0.0, (FOOT_H - 0.06) / fig_h, "Decode keeps one fixed-size state per "
-             "layer: ssm (B, H, P, N), k, v, RoPE angle.", fontsize=9.3, color=MUTED,
+    fig.text(0.0, 1.0 - 0.34 / fig_h, "The data path, in the order mamba3.py runs it.",
+             fontsize=SUB, color=MUTED, va="top")
+    fig.text(0.0, (FOOT_H - 0.04) / fig_h, "Decode keeps one fixed-size state per "
+             "layer: ssm (B, H, P, N), k, v, RoPE angle.", fontsize=FOOT, color=MUTED,
              va="top")
-    fig.text(0.0, (FOOT_H - 0.24) / fig_h, "u, out are (B, L, D)  \u00b7  B batch  "
+    # The symbol key is reference material, not part of the diagram: same
+    # treatment as the setup line under the plots.
+    fig.text(0.0, (FOOT_H - 0.22) / fig_h, "u, out are (B, L, D)  \u00b7  B batch  "
              "\u00b7  H heads  \u00b7  P headdim  \u00b7  N d_state",
-             fontsize=9.3, color=MUTED, va="top")
+             fontsize=META, color=FAINT, va="top")
 
     fig.savefig(ASSETS / "architecture.png")
     plt.close(fig)

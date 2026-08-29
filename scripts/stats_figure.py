@@ -22,17 +22,19 @@ from figstyle import CORAL, MUTED, NAVY, PLUM, TEAL, card, lh, use_style
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 ASSETS.mkdir(exist_ok=True)
 
+# Each caption reads on from its number, so all four stay lowercase. Exponents
+# are written 1e-6: the figure font has no superscript minus.
 CARDS = [
-    (TEAL, "70\u00d7", "SISO scan at L=512, vs the recurrence"),
-    (NAVY, "0.075 ms", "Compiled graph decode, batch 1"),
+    (TEAL, "70\u00d7", "faster scan at L=512"),
+    (NAVY, "0.075 ms", "compiled graph decode, batch 1"),
     (PLUM, "247\u00d7", "smaller than a 16k-token KV cache"),
-    (CORAL, "\u2264 1.1\u00d710\u207b\u2076", "max |\u0394| vs a full forward"),
+    (CORAL, "\u2264 1.1e-6", "max |\u0394| vs a full forward"),
 ]
 
 AX_W = 6.0
 GAP = 0.16
 RADIUS = 0.10
-NUM_SIZE, CAP_SIZE = 25.0, 9.6
+NUM_SIZE, CAP_SIZE = 26.0, 11.0
 PAD = 0.30
 BLEED = 0.04    # the outer cards would otherwise be clipped to half a stroke
 
