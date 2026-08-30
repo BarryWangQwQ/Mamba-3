@@ -16,6 +16,10 @@ The self-checks cover:
   6. Graph decoding matches call-by-call forwards, and states can be reset
      per sample
   7. A torch.compile'd model still works through the graph cache, unchanged
+
+Whichever accelerator the torch build exposes is used, CUDA or otherwise; checks
+6 and 7 need graph capture, which only some backends implement, and are skipped
+where it is missing rather than where the device is not CUDA.
 """
 
 import copy
@@ -38,6 +42,7 @@ from mamba3 import (
     _chunk_scan,
     _mamba3_combined,
     _mamba3_step,
+    _new_graph,
     _recurrent_scan,
     create_block,
     initialize_states,
@@ -45,6 +50,45 @@ from mamba3 import (
     rms_norm_ref,
     update_graph_cache,
 )
+
+
+def _pick_device() -> torch.device:
+    """The accelerator this build actually exposes, else CPU.
+
+    current_accelerator() names the compiled-in backend whether or not it can be
+    reached (a torch built with MPS reports mps on a machine where Metal is
+    unavailable), so is_available() is the part that decides.
+    """
+    if torch.accelerator.is_available():
+        return torch.accelerator.current_accelerator()
+    return torch.device("cpu")
+
+
+def _graph_capture_supported(device) -> bool:
+    """Whether this backend can capture an accelerator graph at all.
+
+    Asks the same _new_graph that capture_graph uses, so the answer tracks
+    whatever mamba3.py can actually reach rather than a list of device names.
+    Only CUDA and XPU register an implementation; on MPS, for one, the neutral
+    API reports "Graph is not supported on device type: mps" and the CUDA
+    fallback cannot be instantiated, so graph decoding is unavailable there.
+    """
+    if device.type == "cpu":
+        return False
+    try:
+        _new_graph()
+    except Exception:
+        return False
+    return True
+
+
+def _device_label(device) -> str:
+    """A printable name for the benchmark header."""
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(0)
+    if device.type == "mps":
+        return "Apple Silicon, Metal"
+    return str(device)
 
 
 def _scan_inputs(device, seqlen=40, rank=1, requires_grad=False):
@@ -343,8 +387,8 @@ def test_compiled_decode(device) -> None:
     wrapper rather than reaching past it.
     """
     print("\n--- torch.compile through the graph cache ---")
-    if device.type == "cpu":
-        print("  skipped (graph capture needs an accelerator).")
+    if not _graph_capture_supported(device):
+        print(f"  skipped ({device.type} has no graph capture backend).")
         return
     import torch._dynamo as dynamo
     if not dynamo.is_inductor_supported():
@@ -390,8 +434,8 @@ def test_compiled_decode(device) -> None:
 def test_graph_decoding(device) -> None:
     """Graph decoding must give the same results as calling forward directly."""
     print("\n--- Graph decoding ---")
-    if device.type != "cuda":
-        print("  skipped (requires CUDA).")
+    if not _graph_capture_supported(device):
+        print(f"  skipped ({device.type} has no graph capture backend).")
         return
 
     torch.manual_seed(0)
@@ -432,8 +476,8 @@ def test_graph_decoding(device) -> None:
 
 
 def benchmark(device) -> None:
-    if device.type != "cuda":
-        print("\nSkipping benchmarks (requires CUDA).")
+    if device.type == "cpu":
+        print("\nSkipping benchmarks (requires an accelerator).")
         return
 
     import time
@@ -441,17 +485,17 @@ def benchmark(device) -> None:
     def timeit(fn, iters=20, warmup=5) -> float:
         for _ in range(warmup):
             fn()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         for _ in range(iters):
             fn()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return (time.perf_counter() - start) / iters * 1000.0
 
     print()
     print("=" * 72)
     print(f"Benchmark  B=8, d_model=384, headdim=64, d_state=64  "
-          f"({torch.cuda.get_device_name(0)})")
+          f"({_device_label(device)})")
     print("=" * 72)
     print(f"{'config':<14}{'seqlen':>8}{'recurrent':>12}{'chunked':>12}"
           f"{'speedup':>10}{'train':>10}")
@@ -477,13 +521,24 @@ def benchmark(device) -> None:
             print(f"{tag:<14}{seqlen:>8}{t_rec:>10.2f}ms{t_chunk:>10.2f}ms"
                   f"{t_rec / t_chunk:>9.1f}x{t_train:>8.2f}ms")
 
+    # Graph replay is a CUDA/XPU column: elsewhere there is no capture backend
+    # to compare the plain forward against, so the table narrows instead.
+    graphs = _graph_capture_supported(device)
+
     print()
     print("=" * 72)
-    print("Single-step decode latency: plain forward vs graph replay "
-          "(3 layers, batch 64, d_model=320)")
+    print(f"Single-step decode latency: plain forward"
+          f"{' vs graph replay' if graphs else ''} "
+          f"(3 layers, batch 64, d_model=320)")
+    if not graphs:
+        print(f"({device.type} has no graph capture backend; "
+              f"the 60FPS budget is measured against the plain forward)")
     print("=" * 72)
-    print(f"{'d_state':>9}{'forward':>14}{'graph replay':>14}{'speedup':>10}"
-          f"{'of 60FPS':>12}")
+    if graphs:
+        print(f"{'d_state':>9}{'forward':>14}{'graph replay':>14}{'speedup':>10}"
+              f"{'of 60FPS':>12}")
+    else:
+        print(f"{'d_state':>9}{'forward':>14}{'of 60FPS':>12}")
     print("-" * 72)
 
     for d_state in (16, 32, 64):
@@ -498,15 +553,20 @@ def benchmark(device) -> None:
             params.seqlen_offset = 1
             t_eager = timeit(lambda: model(x, inference_params=params), iters=100, warmup=30)
 
-            cache = update_graph_cache(model, None, 64, 0, 64)
-            t_graph = timeit(lambda: cache.run(x), iters=100, warmup=30)
+            if graphs:
+                cache = update_graph_cache(model, None, 64, 0, 64)
+                t_graph = timeit(lambda: cache.run(x), iters=100, warmup=30)
 
-        print(f"{d_state:>9}{t_eager:>12.3f}ms{t_graph:>12.3f}ms"
-              f"{t_eager / t_graph:>9.1f}x{t_graph / 16.7 * 100:>11.2f}%")
+        if graphs:
+            print(f"{d_state:>9}{t_eager:>12.3f}ms{t_graph:>12.3f}ms"
+                  f"{t_eager / t_graph:>9.1f}x{t_graph / 16.7 * 100:>11.2f}%")
+        else:
+            print(f"{d_state:>9}{t_eager:>12.3f}ms"
+                  f"{t_eager / 16.7 * 100:>11.2f}%")
 
 
 if __name__ == "__main__":
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = _pick_device()
 
     print("=" * 72)
     print(f"Numerical self-check  (device={dev}, torch={torch.__version__})")
