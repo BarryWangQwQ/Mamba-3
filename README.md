@@ -22,7 +22,7 @@ Copy [`mamba3.py`](mamba3.py) into your project, `pip install torch`, and you ha
 
 **Nothing to build.** No nvcc, no CUDA Toolkit, no MSVC, no Triton, no TileLang, no einops, no `mamba-ssm`. A PyTorch install is the entire dependency list — which is what makes this work on Windows, inside a locked-down container, or on a cluster where you cannot install a toolchain.
 
-**Any device PyTorch has.** The math is ordinary PyTorch ops and the runtime calls around graph capture go through `torch.accelerator`, so there is no vendor-specific path to fall off. The file follows PyTorch to whatever device it supports, CPU included — and CPU is not a degraded mode: given the same weights, forward, backward and decode land within ~3×10⁻⁶ of CUDA in fp32.
+**Any device PyTorch has.** The math is ordinary PyTorch ops and the runtime calls around graph capture go through `torch.accelerator`, so there is no vendor-specific path to fall off. The file follows PyTorch to whatever device it supports, CPU included — and CPU is not a degraded mode: given the same weights, forward, backward and decode land within ~3×10⁻⁶ of CUDA in fp32. Measured on CUDA, Apple Silicon and CPU alike in [Across backends](#across-backends).
 
 **Not a lookalike.** What this file replaces is the official *kernel backend*, not the interface — which is why [the official usage snippet](#install) runs on it with only its import line changed.
 
@@ -277,13 +277,89 @@ Autograd runs straight through the chunked scan — no custom backward, no recom
 ### Reproducing
 
 ```bash
-python scripts/test_mamba3.py      # numerical self-checks + benchmarks
-python scripts/bench_figures.py    # re-measure and redraw every figure above
-python scripts/arch_figure.py      # redraw the diagram at the top
-python scripts/stats_figure.py     # redraw the headline numbers
+python scripts/test_mamba3.py               # numerical self-checks + benchmarks
+python scripts/bench_figures.py             # re-measure and redraw every figure above
+python scripts/bench_figures.py --platform  # add this machine to the cross-platform figure
+python scripts/arch_figure.py               # redraw the diagram at the top
+python scripts/stats_figure.py              # redraw the headline numbers
 ```
 
-`scripts/bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU. Nothing under `scripts/` is needed to use the library — it is there to check the numbers and draw the figures. The root holds one file, and that file is the whole thing.
+Measuring picks up whatever accelerator the torch build exposes; `--device cpu` overrides it, which is how the CPU column below was measured on a machine that has a GPU. `scripts/bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU. Nothing under `scripts/` is needed to use the library — it is there to check the numbers and draw the figures. The root holds one file, and that file is the whole thing.
+
+---
+
+## Across backends
+
+Every number above is one machine. But the claim this file actually makes is a different one — that the same source runs wherever PyTorch runs — and that claim is worth measuring rather than asserting.
+
+So the comparable measurements live in functions that both the full run and `--platform` call, and each backend writes its own `assets/platform_<device>.json`. Sharing the code is the point: a column produced by a near-copy of the measurement would not be comparable to one produced by the original, and nothing in the numbers would show it.
+
+<p align="center">
+  <img src="assets/cross_platform.png" width="600" alt="Every check agrees to about 1e-6 on CUDA, MPS and CPU alike; chunked scan beats the recurrence by 70x, 23x and 5x respectively">
+</p>
+
+### Same weights, same answers
+
+<div align="center">
+
+| max \|Δ\| | RTX 4090 | Apple M4, MPS | Apple M4, CPU |
+|---|---:|---:|---:|
+| Chunked scan vs recurrence, R = 1 / 2 / 4 | 5.7×10⁻⁶ | 5.7×10⁻⁶ | 4.8×10⁻⁶ |
+| Chunked-scan gradients, relative | 3.0×10⁻⁷ | 3.4×10⁻⁷ | 2.2×10⁻⁷ |
+| Segmented `inference_params` | 6.0×10⁻⁷ | 7.2×10⁻⁷ | 9.5×10⁻⁷ |
+| Official `step()` path | 1.1×10⁻⁶ | 1.9×10⁻⁶ | 9.5×10⁻⁷ |
+| Chunked scan, L = 32 … 4096 | 4.8×10⁻⁶ | 7.2×10⁻⁶ | 4.8×10⁻⁶ |
+| Dedicated `_mamba3_step` vs the scan at L = 1 | bit-identical | bit-identical | bit-identical |
+| CPU, same weights, forward / backward / decode | ≤ 3.4×10⁻⁶ | ≤ 4.8×10⁻⁶ | — |
+
+</div>
+
+Each cell is the worst case over the variants behind it, so these are ceilings and not averages. Nothing moves by an order of magnitude between backends, and the ranking of the three does not even stay the same from row to row — which is what fp32 reassociation looks like when no backend is a special case.
+
+Two rows come from elsewhere and say so: the `_mamba3_step` row is asserted with `torch.equal` in `scripts/test_mamba3.py` rather than measured as a difference, and the CUDA cell of the last row is the value already recorded in [Alignment with official](#alignment-with-official) — the direct CPU-vs-accelerator comparison was added to `bench_figures.py` after that run, so re-measuring on a CUDA machine is what fills it in properly.
+
+### What exists where
+
+<div align="center">
+
+| | RTX 4090 | Apple M4, MPS | CPU |
+|---|:-:|:-:|:-:|
+| `forward`, backward, chunked prefill | ✓ | ✓ | ✓ |
+| Segmented resume, eager single-step decode | ✓ | ✓ | ✓ |
+| Dedicated `_mamba3_step` | ✓ | ✓ | ✓ |
+| `torch.compile(fullgraph=True)` | ✓ | ✓ | ✓ |
+| Graph capture and replay | ✓ | — | — |
+
+</div>
+
+One gap, and it is not in this file: PyTorch registers no graph-capture backend for Metal. `torch.accelerator.Graph` answers `Graph is not supported on device type: mps`, and the `torch.cuda.CUDAGraph` fallback in `_new_graph` cannot be instantiated on a machine without CUDA. `capture_graph` does not even reach that point — it fails earlier, in its warmup, because MPS supports no `Stream.synchronize`. Two more calls in the capture path would fail after that if it did: `torch.accelerator.empty_cache` hits an internal assert on MPS, and `torch.accelerator.empty_host_cache` segfaults the interpreter outright.
+
+So the self-checks and the benchmarks skip graph decoding wherever `_new_graph` cannot produce a graph, rather than wherever the device is not CUDA. Everything else on the list above is a path this file takes on all three backends.
+
+Peak-allocation counters are missing on MPS for the same kind of reason — `torch.accelerator.max_memory_allocated` asserts there, and `torch.mps` keeps no high-water mark — so the memory columns of the figures above are genuinely unmeasurable on that backend rather than zero.
+
+### Speed
+
+<div align="center">
+
+| | RTX 4090 | Apple M4, MPS | Apple M4, CPU |
+|---|---:|---:|---:|
+| Chunked over recurrence, SISO, L=512 | **70.1×** | **22.9×** | **5.5×** |
+| Chunked over recurrence, MIMO(R=2), L=512 | **68.3×** | **14.4×** | **3.8×** |
+| Training step, SISO, L=2048 | 33 ms | 585 ms | 898 ms |
+| Per token, SISO, L=2048 | 2.0 µs | 35.7 µs | 54.8 µs |
+| Eager decode, `d_state=32` | 3.22 ms | 9.66 ms | 17.34 ms |
+| Graph replay, `d_state=32` | 0.52 ms | — | — |
+
+</div>
+
+The bold rows are the only ones that carry across machines. A speedup is a ratio of two code paths measured on one device, so it says something about the code; the milliseconds compare a desktop GPU against an integrated one, and say something about hardware instead. Read down this table, not across it.
+
+What those two rows show is that the reason to reach for the chunked scan is not a CUDA artifact. The margin shrinks with the parallelism available — 70× on the 4090, 23× on the M4's GPU, 5.5× on its CPU cores — but it never inverts, and it grows with `L` on all three, which is the property that makes long sequences trainable at all.
+
+The absolute numbers are worth one honest paragraph. Training is ~18× slower on the M4's GPU than on the 4090 at `L=2048`, and its GPU is only 1.5× ahead of its own CPU cores there; single-step decode is 3× behind the 4090's eager path and 19× behind its replayed one. Apple Silicon is a place this file runs correctly and usably, not a place it runs fast — and the graph replay that would close most of the decode gap is exactly what Metal does not offer.
+
+The M4 timings are also the noisiest in this README. Repeating the run moved the `L=512` training step between 118 ms and 183 ms, and the MIMO(R=2) speedup between 14.4× and 18.4× — well outside the ±10% the [Benchmarks](#benchmarks) note claims for the 4090. A laptop chip sharing power and heat with everything else on the machine drifts on a timescale the median of five blocks does not remove, and the MIMO chunked leg is a ~3–5 ms reading where that drift dominates. The SISO speedup repeated to within 0.1× and the `L=2048` step to within 3%, but the M4 columns are worth reading as one significant figure.
 
 ---
 

@@ -1,19 +1,27 @@
 """Measure and plot the benchmark figures shown in README.md.
 
     python scripts/bench_figures.py            # measure on GPU, then plot
-    python scripts/bench_figures.py --replot   # redraw from assets/results.json
+    python scripts/bench_figures.py --platform # measure the portable subset only
+    python scripts/bench_figures.py --replot   # redraw from the stored json
 
-Writes assets/*.png and assets/results.json.
+Writes assets/*.png, assets/results.json and assets/platform_<key>.json.
+
+Measuring runs on whatever accelerator the torch build exposes, and on CPU if
+there is none. What a backend cannot do is recorded as unavailable rather than
+skipped silently, because the cross-platform figure is partly about which paths
+exist where.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import statistics
 import sys
 import textwrap
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -36,6 +44,7 @@ from mamba3 import (
     Mamba3,
     MixerModel,
     _chunk_scan,
+    _new_graph,
     _recurrent_scan,
     initialize_states,
     update_graph_cache,
@@ -173,6 +182,112 @@ def _save(fig, name: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Backend capabilities
+# --------------------------------------------------------------------------
+# Three things differ between backends and none of them are the math: how you
+# wait for queued work, whether peak allocation is tracked, and whether graphs
+# can be captured. Each is probed once here so the measurement code below reads
+# the same on every device.
+def pick_device() -> torch.device:
+    """The accelerator this build actually exposes, else CPU.
+
+    current_accelerator() names the compiled-in backend whether or not it can be
+    reached, so is_available() is the part that decides.
+    """
+    if torch.accelerator.is_available():
+        return torch.accelerator.current_accelerator()
+    return torch.device("cpu")
+
+
+def device_label(device) -> str:
+    """Hardware name for the figure footers, as specific as the backend allows."""
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(0)
+    if device.type == "mps":
+        # Metal exposes no device name; the chip is the useful identifier and
+        # sysctl is where macOS keeps it.
+        import subprocess
+        try:
+            chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            chip = ""
+        return f"{chip} (MPS)" if chip else "Apple Silicon (MPS)"
+    return "CPU"
+
+
+def platform_key(device) -> str:
+    return device.type
+
+
+def sync() -> None:
+    """Wait for queued accelerator work. A no-op on CPU, where there is none."""
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
+
+
+@lru_cache(maxsize=1)
+def _cache_trim():
+    """The callable that releases cached device blocks, or None.
+
+    torch.accelerator.empty_cache is the neutral spelling but it reaches for a
+    DeviceAllocator, which MPS does not register: the call raises an internal
+    assert there while torch.mps.empty_cache works. Probing beats branching on
+    the device name, and doing it once keeps the failure out of the timed loops.
+    """
+    if not torch.accelerator.is_available():
+        return None
+    try:
+        torch.accelerator.empty_cache()
+        return torch.accelerator.empty_cache
+    except Exception:
+        pass
+    if torch.backends.mps.is_available():
+        return torch.mps.empty_cache
+    return None
+
+
+def empty_cache() -> None:
+    trim = _cache_trim()
+    if trim is not None:
+        trim()
+
+
+@lru_cache(maxsize=1)
+def peak_mem_supported() -> bool:
+    """Whether this backend tracks peak allocation.
+
+    MPS reports current and driver-allocated bytes but keeps no high-water mark,
+    so the memory columns are genuinely unavailable there rather than zero.
+    """
+    if not torch.accelerator.is_available():
+        return False
+    try:
+        torch.accelerator.reset_peak_memory_stats()
+        torch.accelerator.max_memory_allocated()
+    except Exception:
+        return False
+    return True
+
+
+def graphs_supported(device) -> bool:
+    """Whether this backend can capture an accelerator graph at all.
+
+    Asks the same _new_graph that capture_graph uses, so the answer tracks what
+    mamba3.py can actually reach. Only CUDA and XPU register an implementation;
+    on MPS the neutral API reports "Graph is not supported on device type: mps"
+    and the CUDA fallback cannot be instantiated.
+    """
+    if device.type == "cpu":
+        return False
+    try:
+        _new_graph()
+    except Exception:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
 # Timing helpers
 # --------------------------------------------------------------------------
 def timeit(fn, iters=20, warmup=5, reps=5, budget_s=2.0) -> float:
@@ -193,14 +308,14 @@ def timeit(fn, iters=20, warmup=5, reps=5, budget_s=2.0) -> float:
     """
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    sync()
 
     times, spent = [], 0.0
     for _ in range(reps):
         start = time.perf_counter()
         for _ in range(iters):
             fn()
-        torch.cuda.synchronize()
+        sync()
         block = time.perf_counter() - start
         spent += block
         times.append(block / iters * 1000.0)
@@ -209,12 +324,17 @@ def timeit(fn, iters=20, warmup=5, reps=5, budget_s=2.0) -> float:
     return statistics.median(times)
 
 
-def peak_mem_mb(fn) -> float:
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+def peak_mem_mb(fn):
+    """Peak allocation during fn, in MiB, or None where the backend has no counter."""
+    if not peak_mem_supported():
+        fn()
+        sync()
+        return None
+    empty_cache()
+    torch.accelerator.reset_peak_memory_stats()
     fn()
-    torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated() / 2**20
+    sync()
+    return torch.accelerator.max_memory_allocated() / 2**20
 
 
 def scan_inputs(device, seqlen=40, rank=1, batch=3, nheads=4, headdim=16, d_state=32,
@@ -257,16 +377,20 @@ class CausalAttention(nn.Module):
         return self.proj(o.transpose(1, 2).reshape(B, L, D))
 
 
-# --------------------------------------------------------------------------
-# Measurements
-# --------------------------------------------------------------------------
-def measure(device) -> dict:
-    torch.manual_seed(0)
-    tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+DECODE_BATCH, DECODE_LEN = 64, 64
 
+
+# --------------------------------------------------------------------------
+# Portable measurements
+# --------------------------------------------------------------------------
+# The quantities the cross-platform figure compares, in functions that both
+# measure() and measure_platform() call. Sharing the code is the whole point: a
+# column produced by a near-copy of the measurement would not be comparable to
+# one produced by the original, and the difference would not be visible in the
+# numbers.
+def measure_scan_alignment(device) -> list:
     print("-- scan alignment (chunked vs recurrence)")
-    scan_alignment = []
+    rows = []
     for rank in (1, 2, 4):
         args, state = scan_inputs(device, rank=rank)
         y_ref, h_ref = _recurrent_scan(*args, *state)
@@ -280,7 +404,7 @@ def measure(device) -> dict:
         g_b = torch.autograd.grad((y_b * wy).sum() + (h_b * wh).sum(), args_b)
         gerr = max((a - b).abs().max().item() for a, b in zip(g_a, g_b))
         gscale = max(a.abs().max().item() for a in g_a)
-        scan_alignment.append({
+        rows.append({
             "rank": rank,
             "fwd_y": (y - y_ref).abs().max().item(),
             "fwd_h": (h - h_ref).abs().max().item(),
@@ -288,7 +412,213 @@ def measure(device) -> dict:
             "grad_scale": gscale,
             "grad_rel": gerr / gscale,
         })
-        print(f"   R={rank}  {scan_alignment[-1]}")
+        print(f"   R={rank}  {rows[-1]}")
+    return rows
+
+
+def measure_layer_alignment(device) -> list:
+    print("-- layer alignment")
+    variants = [
+        ("SISO", dict()),
+        ("SISO + outproj_norm", dict(is_outproj_norm=True)),
+        ("SISO + rope_fraction=1", dict(rope_fraction=1.0)),
+        ("MIMO(R=2)", dict(is_mimo=True, mimo_rank=2, chunk_size=32)),
+        ("MIMO(R=4) + norm", dict(is_mimo=True, mimo_rank=4, chunk_size=16, is_outproj_norm=True)),
+        ("MIMO(R=4) unfused", dict(is_mimo=True, mimo_rank=4, chunk_size=16,
+                                   is_outproj_norm=True, fuse_pregate_headwise_norm=False)),
+    ]
+    rows = []
+    for tag, over in variants:
+        mixer = Mamba3(d_model=128, d_state=32, headdim=32, layer_idx=0, **over).to(device).float()
+        u = torch.randn(3, 40, mixer.d_model, device=device)
+        with torch.no_grad():
+            y_full = mixer(u)
+            p = InferenceParams(max_seqlen=40, max_batch_size=3)
+            y_a = mixer(u[:, :17], inference_params=p)
+            p.seqlen_offset += 17
+            y_b = mixer(u[:, 17:], inference_params=p)
+            e_seg = (torch.cat([y_a, y_b], dim=1) - y_full).abs().max().item()
+            p = InferenceParams(max_seqlen=40, max_batch_size=3)
+            states = mixer._get_states_from_cache(p, 3)
+            outs = [mixer.step(u[:, t], *states)[0] for t in range(u.shape[1])]
+            e_step = (torch.stack(outs, dim=1) - y_full).abs().max().item()
+        rows.append({"tag": tag, "segmented": e_seg, "stepwise": e_step})
+        print(f"   {tag:<24s} seg={e_seg:.2e} step={e_step:.2e}")
+    return rows
+
+
+def measure_stability_len(device) -> list:
+    print("-- error vs sequence length")
+    rows = []
+    for L in (32, 64, 128, 256, 512, 1024, 2048, 4096):
+        args, state = scan_inputs(device, seqlen=L, rank=1)
+        y_ref, h_ref = _recurrent_scan(*args, *state)
+        y, h = _chunk_scan(*args, *state, chunk_size=64)
+        rows.append({
+            "seqlen": L,
+            "err_y": (y - y_ref).abs().max().item(),
+            "err_h": (h - h_ref).abs().max().item(),
+            "scale_y": y_ref.abs().max().item(),
+            "scale_h": h_ref.abs().max().item(),
+        })
+        print(f"   L={L:5d}  Y={rows[-1]['err_y']:.2e}  H={rows[-1]['err_h']:.2e}")
+    return rows
+
+
+def measure_backend_parity(device):
+    """The same weights on CPU and on the accelerator, all three paths.
+
+    The most direct statement of portability there is: not that each backend
+    agrees with a reference computed on itself, but that two backends agree with
+    each other. Meaningless without an accelerator, hence None on CPU.
+    """
+    if device.type == "cpu":
+        return None
+    print("-- cpu vs accelerator parity")
+    torch.manual_seed(0)
+    ref = Mamba3(d_model=128, d_state=32, headdim=32, is_mimo=True, mimo_rank=2,
+                 layer_idx=0).float()
+    x0 = torch.randn(2, 64, 128)
+    token0 = torch.randn(2, 1, 128)
+
+    out = {}
+    for dev in (torch.device("cpu"), device):
+        layer = copy.deepcopy(ref).to(dev)
+        x = x0.clone().to(dev).requires_grad_(True)
+        y = layer(x)
+        y.sum().backward()
+        with torch.inference_mode():
+            p = InferenceParams(max_seqlen=128, max_batch_size=2)
+            layer(x0.to(dev), inference_params=p)
+            p.seqlen_offset = x0.shape[1]
+            step = layer(token0.to(dev), inference_params=p)
+        out[dev.type] = (y.detach().cpu(), x.grad.cpu(), step.cpu())
+
+    row = {name: (out["cpu"][i] - out[device.type][i]).abs().max().item()
+           for i, name in enumerate(("forward", "backward", "decode_step"))}
+    print(f"   {row}")
+    return row
+
+
+def measure_scan_bench(device) -> list:
+    print("-- scan bench")
+    rows = []
+    for is_mimo, rank in ((False, 1), (True, 2)):
+        tag = f"MIMO(R={rank})" if is_mimo else "SISO"
+        chunk = 64 // rank
+        for seqlen in (32, 64, 128, 256, 512):
+            args, state = scan_inputs(device, seqlen=seqlen, rank=rank)
+            t_rec = timeit(lambda: _recurrent_scan(*args, *state))
+            t_chunk = timeit(lambda: _chunk_scan(*args, *state, chunk_size=chunk))
+            rows.append({
+                "tag": tag, "seqlen": seqlen,
+                "recurrent_ms": t_rec, "chunked_ms": t_chunk, "speedup": t_rec / t_chunk,
+            })
+            print(f"   {tag:10s} L={seqlen:3d} rec={t_rec:6.2f} chunk={t_chunk:5.2f} "
+                  f"{t_rec / t_chunk:5.1f}x")
+    return rows
+
+
+def measure_train_bench(device) -> list:
+    print("-- training step")
+    rows = []
+    for is_mimo, rank in ((False, 1), (True, 2)):
+        tag = f"MIMO(R={rank})" if is_mimo else "SISO"
+        mixer = Mamba3(d_model=384, d_state=64, headdim=64, is_mimo=is_mimo, mimo_rank=rank,
+                       chunk_size=64 // rank, layer_idx=0).to(device).float()
+        for seqlen in (128, 256, 512, 1024, 2048):
+            u = torch.randn(8, seqlen, mixer.d_model, device=device)
+
+            def step():
+                mixer.zero_grad(set_to_none=True)
+                mixer(u).square().mean().backward()
+
+            t = timeit(step, iters=10, warmup=4)
+            per_tok = t * 1e3 / (8 * seqlen)
+            rows.append({"tag": tag, "seqlen": seqlen, "ms": t, "us_per_token": per_tok})
+            print(f"   {tag:10s} L={seqlen:4d} {t:7.2f} ms  {per_tok:.3f} us/token")
+            del u
+            empty_cache()
+    return rows
+
+
+def measure_decode_bench(device, graphs: bool) -> list:
+    """Eager single-step decode, and graph replay where the backend has it.
+
+    graph_ms is None rather than absent where capture is unavailable, so a reader
+    of the json can tell "not supported here" from "not measured".
+    """
+    print("-- decode bench")
+    rows = []
+    for d_state in (16, 32, 64):
+        m = MixerModel(320, n_layer=3, rms_norm=True,
+                       ssm_cfg=dict(d_state=d_state, headdim=64)).to(device).eval().float()
+        x = torch.randn(DECODE_BATCH, 1, 320, device=device)
+        with torch.inference_mode():
+            p = InferenceParams(max_seqlen=DECODE_LEN, max_batch_size=DECODE_BATCH)
+            p.key_value_memory_dict = m.allocate_inference_cache(DECODE_BATCH, DECODE_LEN)
+            p.seqlen_offset = 1
+            t_eager = timeit(lambda: m(x, inference_params=p), iters=100, warmup=30)
+            t_graph = None
+            if graphs:
+                cache = update_graph_cache(m, None, DECODE_BATCH, 0, DECODE_LEN)
+                t_graph = timeit(lambda: cache.run(x), iters=100, warmup=30)
+        rows.append({
+            "d_state": d_state, "eager_ms": t_eager, "graph_ms": t_graph,
+            "speedup": t_eager / t_graph if t_graph else None,
+            "pct_of_60fps": (t_graph or t_eager) / 16.7 * 100,
+        })
+        print(f"   N={d_state:2d} eager={t_eager:.3f} graph="
+              + (f"{t_graph:.3f} {t_eager / t_graph:.1f}x" if t_graph else "unsupported"))
+    return rows
+
+
+def measure_platform(device) -> dict:
+    """The portable subset, for one backend, written to assets/platform_<key>.json.
+
+    A cross-platform column needs the same measurement on every machine, and a
+    full measure() run needs a graph backend and a peak-memory counter that not
+    every device has. This is the part that runs anywhere.
+    """
+    torch.manual_seed(0)
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    graphs = graphs_supported(device)
+    try:
+        payload = {
+            "platform": device_label(device),
+            "key": platform_key(device),
+            "device": device.type,
+            "torch": torch.__version__,
+            "graphs": graphs,
+            "peak_mem": peak_mem_supported(),
+            "scan_alignment": measure_scan_alignment(device),
+            "layer_alignment": measure_layer_alignment(device),
+            "stability_len": measure_stability_len(device),
+            "backend_parity": measure_backend_parity(device),
+            "scan_bench": measure_scan_bench(device),
+            "train_bench": measure_train_bench(device),
+            "decode_bench": measure_decode_bench(device, graphs),
+        }
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+
+    path = ASSETS / f"platform_{payload['key']}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"wrote {path.name}")
+    return payload
+
+
+# --------------------------------------------------------------------------
+# Measurements
+# --------------------------------------------------------------------------
+def measure(device) -> dict:
+    torch.manual_seed(0)
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    graphs = graphs_supported(device)
+
+    scan_alignment = measure_scan_alignment(device)
 
     print("-- chunk-size sweep")
     chunk_sweep = []
@@ -311,66 +641,31 @@ def measure(device) -> dict:
             chunk_speed.append({"rank": rank, "chunk_size": q, "ms": t})
             print(f"   R={rank} Q={q:3d}  {t:.3f} ms")
 
-    print("-- layer alignment")
-    variants = [
-        ("SISO", dict()),
-        ("SISO + outproj_norm", dict(is_outproj_norm=True)),
-        ("SISO + rope_fraction=1", dict(rope_fraction=1.0)),
-        ("MIMO(R=2)", dict(is_mimo=True, mimo_rank=2, chunk_size=32)),
-        ("MIMO(R=4) + norm", dict(is_mimo=True, mimo_rank=4, chunk_size=16, is_outproj_norm=True)),
-        ("MIMO(R=4) unfused", dict(is_mimo=True, mimo_rank=4, chunk_size=16,
-                                   is_outproj_norm=True, fuse_pregate_headwise_norm=False)),
-    ]
-    layer_alignment = []
-    for tag, over in variants:
-        mixer = Mamba3(d_model=128, d_state=32, headdim=32, layer_idx=0, **over).to(device).float()
-        u = torch.randn(3, 40, mixer.d_model, device=device)
-        with torch.no_grad():
-            y_full = mixer(u)
-            p = InferenceParams(max_seqlen=40, max_batch_size=3)
-            y_a = mixer(u[:, :17], inference_params=p)
-            p.seqlen_offset += 17
-            y_b = mixer(u[:, 17:], inference_params=p)
-            e_seg = (torch.cat([y_a, y_b], dim=1) - y_full).abs().max().item()
-            p = InferenceParams(max_seqlen=40, max_batch_size=3)
-            states = mixer._get_states_from_cache(p, 3)
-            outs = [mixer.step(u[:, t], *states)[0] for t in range(u.shape[1])]
-            e_step = (torch.stack(outs, dim=1) - y_full).abs().max().item()
-        layer_alignment.append({"tag": tag, "segmented": e_seg, "stepwise": e_step})
-        print(f"   {tag:<24s} seg={e_seg:.2e} step={e_step:.2e}")
+    layer_alignment = measure_layer_alignment(device)
 
     print("-- graph replay")
-    model = MixerModel(128, n_layer=3, rms_norm=True,
-                       ssm_cfg=dict(d_state=32, headdim=32)).to(device).eval().float()
-    frames = [torch.randn(6, 1, 128, device=device) for _ in range(10)]
-    p = InferenceParams(max_seqlen=64, max_batch_size=6)
-    with torch.inference_mode():
-        ref = []
-        for x in frames:
-            ref.append(model(x, inference_params=p).clone())
-            p.seqlen_offset += 1
-        cache = update_graph_cache(model, None, 6, 0, 64)
-        got = [cache.run(x) for x in frames]
-        cg_err = max((a - b).abs().max().item() for a, b in zip(ref, got))
-        initialize_states(cache.inference_params)
-        cg_reset = (cache.run(frames[0]) - ref[0]).abs().max().item()
-    print(f"   graph={cg_err:.2e}  reset={cg_reset:.2e}")
+    cg_err = cg_reset = None
+    if not graphs:
+        print(f"   unsupported ({device.type} has no graph capture backend)")
+    else:
+        model = MixerModel(128, n_layer=3, rms_norm=True,
+                           ssm_cfg=dict(d_state=32, headdim=32)).to(device).eval().float()
+        frames = [torch.randn(6, 1, 128, device=device) for _ in range(10)]
+        p = InferenceParams(max_seqlen=64, max_batch_size=6)
+        with torch.inference_mode():
+            ref = []
+            for x in frames:
+                ref.append(model(x, inference_params=p).clone())
+                p.seqlen_offset += 1
+            cache = update_graph_cache(model, None, 6, 0, 64)
+            got = [cache.run(x) for x in frames]
+            cg_err = max((a - b).abs().max().item() for a, b in zip(ref, got))
+            initialize_states(cache.inference_params)
+            cg_reset = (cache.run(frames[0]) - ref[0]).abs().max().item()
+        print(f"   graph={cg_err:.2e}  reset={cg_reset:.2e}")
 
-    print("-- error vs sequence length")
-    stability_len = []
-    for L in (32, 64, 128, 256, 512, 1024, 2048, 4096):
-        args, state = scan_inputs(device, seqlen=L, rank=1)
-        y_ref, h_ref = _recurrent_scan(*args, *state)
-        y, h = _chunk_scan(*args, *state, chunk_size=64)
-        stability_len.append({
-            "seqlen": L,
-            "err_y": (y - y_ref).abs().max().item(),
-            "err_h": (h - h_ref).abs().max().item(),
-            "scale_y": y_ref.abs().max().item(),
-            "scale_h": h_ref.abs().max().item(),
-        })
-        r = stability_len[-1]
-        print(f"   L={L:5d}  Y={r['err_y']:.2e}  H={r['err_h']:.2e}")
+    stability_len = measure_stability_len(device)
+    backend_parity = measure_backend_parity(device)
 
     print("-- streaming decode drift")
     drift_steps = 1024
@@ -386,46 +681,12 @@ def measure(device) -> dict:
     print(f"   {drift_steps} steps: first={drift[0]:.2e}  last={drift[-1]:.2e}  "
           f"max={max(drift):.2e}")
     del u, y_full
-    torch.cuda.empty_cache()
+    empty_cache()
 
     torch.backends.cuda.matmul.allow_tf32 = tf32
 
-    print("-- scan bench")
-    scan_bench = []
-    seqlens = (32, 64, 128, 256, 512)
-    for is_mimo, rank in ((False, 1), (True, 2)):
-        tag = f"MIMO(R={rank})" if is_mimo else "SISO"
-        chunk = 64 // rank
-        for seqlen in seqlens:
-            args, state = scan_inputs(device, seqlen=seqlen, rank=rank)
-            t_rec = timeit(lambda: _recurrent_scan(*args, *state))
-            t_chunk = timeit(lambda: _chunk_scan(*args, *state, chunk_size=chunk))
-            scan_bench.append({
-                "tag": tag, "seqlen": seqlen,
-                "recurrent_ms": t_rec, "chunked_ms": t_chunk, "speedup": t_rec / t_chunk,
-            })
-            print(f"   {tag:10s} L={seqlen:3d} rec={t_rec:6.2f} chunk={t_chunk:5.2f} "
-                  f"{t_rec / t_chunk:5.1f}x")
-
-    print("-- training step")
-    train_bench = []
-    for is_mimo, rank in ((False, 1), (True, 2)):
-        tag = f"MIMO(R={rank})" if is_mimo else "SISO"
-        mixer = Mamba3(d_model=384, d_state=64, headdim=64, is_mimo=is_mimo, mimo_rank=rank,
-                       chunk_size=64 // rank, layer_idx=0).to(device).float()
-        for seqlen in (128, 256, 512, 1024, 2048):
-            u = torch.randn(8, seqlen, mixer.d_model, device=device)
-
-            def step():
-                mixer.zero_grad(set_to_none=True)
-                mixer(u).square().mean().backward()
-
-            t = timeit(step, iters=10, warmup=4)
-            per_tok = t * 1e3 / (8 * seqlen)
-            train_bench.append({"tag": tag, "seqlen": seqlen, "ms": t, "us_per_token": per_tok})
-            print(f"   {tag:10s} L={seqlen:4d} {t:7.2f} ms  {per_tok:.3f} us/token")
-            del u
-            torch.cuda.empty_cache()
+    scan_bench = measure_scan_bench(device)
+    train_bench = measure_train_bench(device)
 
     print("-- decode vs attention with a KV cache")
     d_model, nheads, dec_batch = 384, 6, 4
@@ -469,29 +730,10 @@ def measure(device) -> dict:
             print(f"   ctx={ctx:6d}  ssm={t_m:6.3f}ms/{state_mb:8.3f}MB   "
                   f"attn={t_a:6.3f}ms/{cache_mb:8.2f}MB")
             del k_cache, v_cache
-            torch.cuda.empty_cache()
+            empty_cache()
 
-    print("-- decode bench")
-    decode_bench = []
-    dec_bs, dec_len = 64, 64
-    for d_state in (16, 32, 64):
-        m = MixerModel(320, n_layer=3, rms_norm=True,
-                       ssm_cfg=dict(d_state=d_state, headdim=64)).to(device).eval().float()
-        x = torch.randn(dec_bs, 1, 320, device=device)
-        with torch.inference_mode():
-            p = InferenceParams(max_seqlen=dec_len, max_batch_size=dec_bs)
-            p.key_value_memory_dict = m.allocate_inference_cache(dec_bs, dec_len)
-            p.seqlen_offset = 1
-            t_eager = timeit(lambda: m(x, inference_params=p), iters=100, warmup=30)
-            cache = update_graph_cache(m, None, dec_bs, 0, dec_len)
-            t_graph = timeit(lambda: cache.run(x), iters=100, warmup=30)
-        decode_bench.append({
-            "d_state": d_state, "eager_ms": t_eager, "graph_ms": t_graph,
-            "speedup": t_eager / t_graph, "pct_of_60fps": t_graph / 16.7 * 100,
-        })
-        print(f"   N={d_state:2d} eager={t_eager:.3f} graph={t_graph:.3f} "
-              f"{t_eager / t_graph:.1f}x")
-    decode_bench_params = {"batch": dec_bs, "n_layer": 3, "d_model": 320, "headdim": 64}
+    decode_bench = measure_decode_bench(device, graphs)
+    decode_bench_params = {"batch": DECODE_BATCH, "n_layer": 3, "d_model": 320, "headdim": 64}
 
     print("-- compile bench")
     # The four configurations of the decode path, since compilation and replay
@@ -509,34 +751,41 @@ def measure(device) -> dict:
                                  ("graph", None, True),
                                  ("compile_graph", "default", True),
                                  ("compile_ro_graph", "reduce-overhead", True)):
+            if graph and not graphs:
+                row[tag] = row[tag + "_mib"] = None
+                continue
             dynamo.reset()
-            torch.accelerator.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+            empty_cache()
+            if peak_mem_supported():
+                torch.accelerator.reset_peak_memory_stats()
             m = MixerModel(320, n_layer=3, rms_norm=True,
                            ssm_cfg=dict(d_state=32, headdim=64)).to(device).eval().float()
             x = torch.randn(batch, 1, 320, device=device)
             try:
                 with torch.inference_mode():
                     fn = m if mode is None else torch.compile(m, mode=mode, fullgraph=True)
-                    p = InferenceParams(max_seqlen=dec_len, max_batch_size=batch)
-                    p.key_value_memory_dict = m.allocate_inference_cache(batch, dec_len)
+                    p = InferenceParams(max_seqlen=DECODE_LEN, max_batch_size=batch)
+                    p.key_value_memory_dict = m.allocate_inference_cache(batch, DECODE_LEN)
                     p.seqlen_offset = 1
                     for _ in range(5):
                         fn(x, inference_params=p)
                     if graph:
-                        cache = update_graph_cache(fn, None, batch, 0, dec_len)
+                        cache = update_graph_cache(fn, None, batch, 0, DECODE_LEN)
                         call = lambda: cache.run(x)
                     else:
                         call = lambda: fn(x, inference_params=p)
                     row[tag] = timeit(call, iters=100, warmup=30)
-                row[tag + "_mib"] = torch.cuda.max_memory_allocated() / 2**20
+                row[tag + "_mib"] = (torch.accelerator.max_memory_allocated() / 2**20
+                                     if peak_mem_supported() else None)
             except Exception as exc:
                 row[tag] = row[tag + "_mib"] = None
                 print(f"   B={batch} {tag} failed: {type(exc).__name__}")
         compile_bench.append(row)
+        done = [k for k in row
+                if not k.endswith("_mib") and k != "batch" and row[k] is not None]
         print(f"   B={batch} " + "  ".join(
-            f"{k}={row[k]:.3f}/{row[k + '_mib']:.0f}MiB"
-            for k in row if not k.endswith("_mib") and k != "batch" and row[k] is not None))
+            f"{k}={row[k]:.3f}" + (f"/{row[k + '_mib']:.0f}MiB" if row[k + "_mib"] else "")
+            for k in done))
     dynamo.reset()
 
     print("-- trainable length: chunked scan vs the naive recurrence")
@@ -564,20 +813,27 @@ def measure(device) -> dict:
                 row[f"{tag}_mb"] = peak_mem_mb(step(fn, **kw))
             except torch.OutOfMemoryError:
                 row[f"{tag}_ms"] = row[f"{tag}_mb"] = None
-                torch.cuda.empty_cache()
+                empty_cache()
                 print(f"   L={L:5d}  {tag}: out of memory")
         long_context.append(row)
-        print(f"   L={L:5d}  chunked={row['chunked_ms']:7.2f}ms/{row['chunked_mb']:8.1f}MB   "
-              f"recurrent={row['recurrent_ms']:8.2f}ms/{row['recurrent_mb']:9.1f}MB")
+        shown = "   ".join(
+            f"{tag}={row[f'{tag}_ms']:7.2f}ms"
+            + (f"/{row[f'{tag}_mb']:8.1f}MB" if row[f"{tag}_mb"] is not None else "")
+            for tag in ("chunked", "recurrent") if row[f"{tag}_ms"] is not None)
+        print(f"   L={L:5d}  {shown}")
         del args, state
-        torch.cuda.empty_cache()
+        empty_cache()
     long_context_params = {"batch": 4, "nheads": 6, "headdim": 64, "d_state": 64,
                            "chunk_size": 64}
 
     payload = {
-        "gpu": torch.cuda.get_device_name(0),
+        "gpu": device_label(device),
+        "device": device.type,
         "torch": torch.__version__,
+        "graphs": graphs,
+        "peak_mem": peak_mem_supported(),
         "official_package": "mamba_ssm not installed — official fused kernels not compared",
+        "backend_parity": backend_parity,
         "scan_alignment": scan_alignment,
         "chunk_sweep": chunk_sweep,
         "chunk_speed": chunk_speed,
@@ -987,6 +1243,159 @@ def plot_compile(D) -> None:
     _save(fig, "compile.png")
 
 
+# Drawn in this order wherever a platform axis appears, so the figure does not
+# reshuffle when a machine is added.
+PLATFORM_ORDER = ("cuda", "xpu", "mps", "cpu")
+PLATFORM_COLORS = {"cuda": TEAL, "xpu": PLUM, "mps": CORAL, "cpu": NAVY}
+
+# Checks every backend runs against its own reference. The direct CPU-vs-
+# accelerator comparison is deliberately not here: it does not exist for CPU and
+# was not recorded on the CUDA run, so it would draw as one lone bar in a group
+# of three and read as missing data. It belongs in the README table, where the
+# gap can be named.
+CONSISTENCY_CHECKS = (
+    ("chunked", "Chunked\nvs recur."),
+    ("grad", "Gradients\n(rel.)"),
+    ("segmented", "Segmented\nresume"),
+    ("stepwise", "step()\npath"),
+)
+
+
+def _platform_view(payload):
+    """The comparable subset of a results.json or platform_<key>.json payload.
+
+    Both files carry these fields for the same quantities because the same
+    functions wrote them, which is what makes a column from one machine
+    comparable to a column from another.
+    """
+    key = payload.get("key") or payload.get("device")
+    if key is None:
+        # results.json predates these keys. It records the build it ran on, and
+        # a +cu wheel is a CUDA run; nothing else in the file needs guessing.
+        key = "cuda" if "+cu" in payload.get("torch", "") else None
+        if key is None:
+            return None
+    return {
+        "key": key,
+        "label": payload.get("platform") or payload.get("gpu") or key,
+        "torch": payload.get("torch", ""),
+        "graphs": payload.get("graphs"),
+        "scan_alignment": payload.get("scan_alignment"),
+        "layer_alignment": payload.get("layer_alignment"),
+        "backend_parity": payload.get("backend_parity"),
+        "scan_bench": payload.get("scan_bench"),
+        "train_bench": payload.get("train_bench"),
+        "decode_bench": payload.get("decode_bench"),
+    }
+
+
+def load_platforms() -> list:
+    """Every backend measured so far, in PLATFORM_ORDER.
+
+    The full run in results.json counts as one of them, so the machine that
+    draws all the other figures needs no second pass. A --platform re-run of the
+    same backend does not displace it: the full run measured strictly more.
+    """
+    views = {}
+    for path in [ASSETS / "results.json", *sorted(ASSETS.glob("platform_*.json"))]:
+        if not path.exists():
+            continue
+        view = _platform_view(json.loads(path.read_text(encoding="utf-8")))
+        if view is not None:
+            views.setdefault(view["key"], view)
+    return [views[k] for k in PLATFORM_ORDER if k in views]
+
+
+def _consistency(view) -> dict:
+    """max |Δ| per check for one backend; None where the check was not recorded."""
+    scan = view.get("scan_alignment") or []
+    layer = view.get("layer_alignment") or []
+    return {
+        "chunked": max((r["fwd_y"] for r in scan), default=None),
+        "grad": max((r["grad_rel"] for r in scan), default=None),
+        "segmented": max((r["segmented"] for r in layer), default=None),
+        "stepwise": max((r["stepwise"] for r in layer), default=None),
+    }
+
+
+def plot_cross_platform(platforms) -> None:
+    """Agreement and portable speedup, side by side across backends.
+
+    Colour means backend in both panels, which is why the upper one groups by
+    check rather than colouring by it: one legend, one meaning, read once.
+
+    The lower panel plots the speedup rather than the times on purpose. A 4090
+    and a laptop chip cannot be compared in milliseconds without the figure
+    turning into a hardware review, but the ratio of the two code paths on one
+    machine is a property of the code, and that is the claim being made.
+    """
+    if len(platforms) < 2:
+        print("skipping cross_platform.png (needs two backends; "
+              "run --platform on another device)")
+        return
+
+    fig, (ax_c, ax_s) = _stacked(height=7.6, ratios=(1.15, 1.0))
+
+    rows = {p["key"]: _consistency(p) for p in platforms}
+    x = np.arange(len(CONSISTENCY_CHECKS))
+    w = 0.78 / len(platforms)
+    for i, p in enumerate(platforms):
+        off = (i - (len(platforms) - 1) / 2) * w
+        vals = [rows[p["key"]][key] for key, _ in CONSISTENCY_CHECKS]
+        # A missing check leaves a gap rather than a zero-height bar, which on a
+        # log axis would draw as a full-height one.
+        ax_c.bar([xi + off for xi, v in zip(x, vals) if v is not None],
+                 [v for v in vals if v is not None], w,
+                 color=PLATFORM_COLORS.get(p["key"], SLATE),
+                 label=p["label"], zorder=2)
+
+    _style(ax_c, log=True)
+    ax_c.set_yscale("log")
+    # Headroom for two rows of annotation above the tallest bar: the legend, and
+    # the tolerance line with its label.
+    ax_c.set_ylim(4e-8, 4e-3)
+    ax_c.axhline(1e-4, color=SLATE, lw=1.0, ls=(0, (3, 2)))
+    ax_c.text(len(CONSISTENCY_CHECKS) - 0.45, 1.2e-4, "self-check tolerance  1e-4",
+              color=MUTED, fontsize=FOOT, ha="right", va="bottom")
+    ax_c.set_xticks(x)
+    ax_c.set_xticklabels([label for _, label in CONSISTENCY_CHECKS], fontsize=11.2)
+    ax_c.set_title("Same weights, same answers  (max |Δ|)", loc="left")
+    ax_c.legend(loc="upper left", ncol=len(platforms), columnspacing=1.1,
+                handlelength=1.4, fontsize=11.4)
+
+    for p in platforms:
+        sel = [r for r in (p.get("scan_bench") or []) if r["tag"] == "SISO"]
+        if not sel:
+            continue
+        ax_s.plot([r["seqlen"] for r in sel], [r["speedup"] for r in sel],
+                  color=PLATFORM_COLORS.get(p["key"], SLATE), marker="o", ms=6.2,
+                  mfc="white", mew=1.8)
+        last = sel[-1]
+        ax_s.annotate(f"{last['speedup']:.0f}×", (last["seqlen"], last["speedup"]),
+                      textcoords="offset points", xytext=(-6, 9), ha="right",
+                      color=PLATFORM_COLORS.get(p["key"], SLATE), fontsize=NOTE,
+                      fontweight="bold")
+
+    _style(ax_s, log=True)
+    ax_s.set_xscale("log", base=2)
+    ax_s.set_yscale("log")
+    ax_s.set_xticks([32, 64, 128, 256, 512])
+    ax_s.set_xticklabels(["32", "64", "128", "256", "512"])
+    # A decade locator would label 10× and nothing else across a range that only
+    # spans 2×–70×, so the ticks are named outright.
+    ax_s.set_yticks([2, 5, 10, 20, 50])
+    ax_s.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}×"))
+    ax_s.yaxis.set_minor_formatter(mticker.NullFormatter())
+    ax_s.set_xlabel("Sequence length")
+    ax_s.set_title("Chunked scan over the recurrence, SISO  (×)", loc="left")
+
+    _heading(fig, "The same file on every backend",
+             "Agreement to ~1e-6 everywhere; the chunked win is not CUDA-specific")
+    _footer(fig, "  ·  ".join(f"{p['label']}, torch {p['torch']}" for p in platforms)
+                 + "  ·  fp32, TF32 off")
+    _save(fig, "cross_platform.png")
+
+
 def plot_all(D) -> None:
     plot_scan(D)
     plot_decode_scaling(D)
@@ -999,18 +1408,61 @@ def plot_all(D) -> None:
     plot_long_context(D)
 
 
+def _guard_results(device, force: bool) -> None:
+    """Refuse to replace a recorded run from another backend by accident.
+
+    results.json backs almost every figure in the README, and the prose around
+    them names the machine they were measured on. Measuring no longer requires
+    CUDA, so without this a run on a laptop would quietly replace that dataset
+    with one the surrounding text no longer describes. --platform is the way to
+    add a backend without touching it.
+    """
+    path = ASSETS / "results.json"
+    if force or not path.exists():
+        return
+    old = json.loads(path.read_text(encoding="utf-8"))
+    was = old.get("device") or ("cuda" if "+cu" in old.get("torch", "") else None)
+    if was is None or was == device.type:
+        return
+    raise SystemExit(
+        f"assets/results.json holds a {was} run ({old.get('gpu', 'unknown')}), and "
+        f"measuring on {device.type} would replace it.\n"
+        f"Use --platform to add {device.type} to the cross-platform figure, or "
+        f"--force to overwrite anyway."
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--replot", action="store_true", help="redraw from assets/results.json")
+    ap.add_argument("--replot", action="store_true", help="redraw from the stored json")
+    ap.add_argument("--platform", action="store_true",
+                    help="measure only the portable subset, for the cross-platform figure")
+    # The CPU column of the cross-platform figure has to be measurable on a
+    # machine that has an accelerator, or it never gets measured at all.
+    ap.add_argument("--device", default=None,
+                    help="measure on this device instead of the one torch picks")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite results.json even if it holds another backend's run")
     args = ap.parse_args()
+
+    if args.platform:
+        device = torch.device(args.device) if args.device else pick_device()
+        print(f"portable subset on {device_label(device)}  ({device.type})")
+        measure_platform(device)
+        plot_cross_platform(load_platforms())
+        print("done")
+        return
 
     if args.replot:
         D = json.loads((ASSETS / "results.json").read_text(encoding="utf-8"))
     else:
-        assert torch.cuda.is_available(), "measuring needs a CUDA device; use --replot"
+        device = torch.device(args.device) if args.device else pick_device()
+        assert device.type != "cpu", "measuring needs an accelerator; use --replot"
+        _guard_results(device, args.force)
         torch.backends.cudnn.benchmark = True
-        D = measure(torch.device("cuda"))
+        D = measure(device)
     plot_all(D)
+    plot_cross_platform(load_platforms())
     print("done")
 
 
