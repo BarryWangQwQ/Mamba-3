@@ -274,18 +274,6 @@ Autograd runs straight through the chunked scan — no custom backward, no recom
   <img src="assets/training.png" width="600" alt="Forward + backward time and per-token cost">
 </p>
 
-### Reproducing
-
-```bash
-python scripts/test_mamba3.py               # numerical self-checks + benchmarks
-python scripts/bench_figures.py             # re-measure and redraw every figure above
-python scripts/bench_figures.py --platform  # add this machine to the cross-platform figure
-python scripts/arch_figure.py               # redraw the diagram at the top
-python scripts/stats_figure.py              # redraw the headline numbers
-```
-
-Measuring picks up whatever accelerator the torch build exposes; `--device cpu` overrides it, which is how the CPU column below was measured on a machine that has a GPU. `scripts/bench_figures.py --replot` redraws from `assets/results.json` without touching the GPU. Nothing under `scripts/` is needed to use the library — it is there to check the numbers and draw the figures. The root holds one file, and that file is the whole thing.
-
 ---
 
 ## Across backends
@@ -360,6 +348,20 @@ What those two rows show is that the reason to reach for the chunked scan is not
 The absolute numbers are worth one honest paragraph. Training is ~18× slower on the M4's GPU than on the 4090 at `L=2048`, and its GPU is only 1.5× ahead of its own CPU cores there; single-step decode is 3× behind the 4090's eager path and 19× behind its replayed one. Apple Silicon is a place this file runs correctly and usably, not a place it runs fast — and the graph replay that would close most of the decode gap is exactly what Metal does not offer.
 
 The M4 timings are also the noisiest in this README. Repeating the run moved the `L=512` training step between 118 ms and 183 ms, and the MIMO(R=2) speedup between 14.4× and 18.4× — well outside the ±10% the [Benchmarks](#benchmarks) note claims for the 4090. A laptop chip sharing power and heat with everything else on the machine drifts on a timescale the median of five blocks does not remove, and the MIMO chunked leg is a ~3–5 ms reading where that drift dominates. The SISO speedup repeated to within 0.1× and the `L=2048` step to within 3%, but the M4 columns are worth reading as one significant figure.
+
+---
+
+## Reproducing
+
+```bash
+python scripts/test_mamba3.py               # numerical self-checks + benchmarks
+python scripts/bench_figures.py             # re-measure and redraw every figure above
+python scripts/bench_figures.py --platform  # add this machine to the cross-platform figure
+python scripts/arch_figure.py               # redraw the diagram at the top
+python scripts/stats_figure.py              # redraw the headline numbers
+```
+
+Measuring picks up whatever accelerator the torch build exposes; `--device cpu` overrides it, which is how the CPU column above was measured on a machine that has a GPU. `scripts/bench_figures.py --replot` redraws from the stored json without touching the GPU. Nothing under `scripts/` is needed to use the library — it is there to check the numbers and draw the figures. The root holds one file, and that file is the whole thing.
 
 ---
 
